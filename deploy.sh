@@ -20,7 +20,7 @@ err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 fatal() { err "$*"; exit 1; }
 
 # ─── 配置变量 ─────────────────────────────────────────────────────
-NODE_MAJOR=22
+NODE_MAJOR=24
 CODES_REPO="https://github.com/bigbrother666sh/codes.git"
 CODES_DIR="$HOME/codes"
 
@@ -180,34 +180,20 @@ else
 SETTINGSEOF
   ok "已创建最小 Claude Code 配置"
 
-  warn "请确保设置 Claude Code 的 API 凭据:"
-  if [ -n "$ANTHROPIC_BASE_URL" ]; then
-    echo "  export ANTHROPIC_BASE_URL=\"${ANTHROPIC_BASE_URL}\""
-  fi
-  echo "  export ANTHROPIC_AUTH_TOKEN=\"${ANTHROPIC_AUTH_TOKEN}\""
-  echo ""
-  echo "  建议写入 ~/.profile 或 ~/.bashrc"
+  warn "请自行配置 Claude Code API 凭据 (ANTHROPIC_AUTH_TOKEN 等)"
+  warn "建议写入 ~/.profile 或 ~/.bashrc，或通过 claude login 登录"
 fi
 
 # 写入 bridge.env（供 systemd 服务读取）
 {
   [ -n "$ANTHROPIC_BASE_URL" ] && echo "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}"
-  echo "ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}"
   echo "DISABLE_AUTO_UPDATE=1"
 } > "$HOME/.codes/bridge.env"
 chmod 600 "$HOME/.codes/bridge.env"
-ok "API 环境变量已写入 ~/.codes/bridge.env"
+ok "bridge.env 已写入 ~/.codes/bridge.env"
 
-# 同时写入 ~/.bashrc（供 SSH 登录后手动使用 claude 命令）
-if ! grep -q 'ANTHROPIC_AUTH_TOKEN' "$HOME/.bashrc" 2>/dev/null; then
-  {
-    echo ""
-    echo "# Claude Code API"
-    [ -n "$ANTHROPIC_BASE_URL" ] && echo "export ANTHROPIC_BASE_URL=\"${ANTHROPIC_BASE_URL}\""
-    echo "export ANTHROPIC_AUTH_TOKEN=\"${ANTHROPIC_AUTH_TOKEN}\""
-  } >> "$HOME/.bashrc"
-  ok "API 环境变量已写入 ~/.bashrc"
-fi
+warn "请自行配置 Claude Code API 凭据 (ANTHROPIC_AUTH_TOKEN 等)，"
+warn "建议写入 ~/.profile 或 ~/.bashrc，或通过 claude login 登录。"
 
 # ─── Phase 6: Claude Enhance 安装 ─────────────────────────────────
 info "Phase 6/7: 安装 Claude Enhance..."
