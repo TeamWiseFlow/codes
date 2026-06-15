@@ -27,8 +27,9 @@ bridge.mjs (单 Node.js 进程)
 ├── ClaudeProcess (每个项目一个) — 管理 claude 子进程
 │     ├── spawn: claude --output-format stream-json --input-format stream-json
 │     ├── stdin: 发送用户消息 (JSONL)
-│     ├── stdout: 读取事件流，检测 type:"result" 标记轮次结束
-│     └── respawn: 下次消息时以 --resume <session-id> 自��重启
+│     ├── stdout: 读取事件流，type:"assistant" 增量推送流式文本，type:"result" 标记轮次结束
+│     ├── onStream: 流式回调，将累积文本实时推送给 Feishu streaming card
+│     └── respawn: 下次消息时以 --resume <session-id> 自动重启
 ├── ProjectManager — 管理多个项目的 Claude 进程生命周期
 │     ├── init() — 加载配置，恢复会话，注册信号处理
 │     ├── startProject/stopProject — 按 alias 启停
@@ -36,7 +37,8 @@ bridge.mjs (单 Node.js 进程)
 └── FeishuBot (每个项目一个) — 管理飞书 WebSocket 连接
       ├── createLarkChannel (每个 bot app 一个，SDK 1.66+)
       ├── channel.on({ message, cardAction, ... }) 事件监听
-      └── channel.send / channel.stream 回复
+      ├── channel.stream({ markdown }) 流式回复（打字机效果 + 自动 rollover）
+      └── channel.send 非流式回复（slash 命令等）
 ```
 
 ## Key Files
@@ -58,6 +60,8 @@ bridge.mjs (单 Node.js 进程)
 ## Key Patterns
 
 - **stream-json 协议**: Claude CLI 的 `--output-format stream-json --input-format stream-json` 模式，stdin/stdout 通过 JSONL 通信
+- **飞书流式回复**: `channel.stream({ markdown: producer })` 使用飞书原生 streaming card（打字机效果），SDK 自动处理 throttling 和 rollover（超 30KB 自动续接新卡片）
+- **processAndReply()**: 统一的 Claude→飞书回复函数，优先走 streaming 路径，stream 启动失败时 fallback 到非流式 sendReplyToFeishu()
 - **会话持久化**: ClaudeProcess 自动保存 session-id，进程重启后以 `--resume` 恢复
 - **多 bot 初始化**: 每个 feishu.appId 对应独立的 createLarkChannel 实例，一个 bridge 进程可服务多个飞书 bot
 - **飞书命令**: `/start`, `/stop`, `/reset`, `/interrupt`, `/cost`, `/context`, `/status`, `/help` — 以 `/` 开头的消息作为控制命令处理；未识别的斜杠命令透传给 Claude Code

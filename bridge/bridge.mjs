@@ -522,6 +522,8 @@ class ClaudeProcess {
     this._interrupted = false;
     this._busySince = null;       // Date.now() when sendMessage starts
     this._lastActivity = null;    // { type, tool, ts } from intermediate events
+    this._onStream = null;        // callback(accumulatedText) for streaming
+    this._streamedText = '';      // accumulated display text for streaming
   }
 
   _spawn() {
@@ -568,7 +570,7 @@ class ClaudeProcess {
    * @param {string} text
    * @returns {Promise<{text: string, sessionId: string|null, costUsd: number}>}
    */
-  async sendMessage(text) {
+  async sendMessage(text, { onStream = null } = {}) {
     if (this._status === 'stopped') {
       throw new Error('ClaudeProcess is stopped');
     }
@@ -584,6 +586,8 @@ class ClaudeProcess {
     this._status = 'busy';
     this._busySince = Date.now();
     this._lastActivity = { type: 'thinking', tool: null, ts: Date.now() };
+    this._onStream = onStream;
+    this._streamedText = '';
 
     return new Promise((resolve, reject) => {
       this._pendingResolve = resolve;
@@ -598,6 +602,8 @@ class ClaudeProcess {
         this._stdin.write(msg);
       } catch (err) {
         this._status = 'idle';
+        this._onStream = null;
+        this._streamedText = '';
         this._pendingResolve = null;
         this._pendingReject = null;
         reject(new Error(`Failed to write to claude stdin: ${err.message}`));
@@ -631,9 +637,26 @@ class ClaudeProcess {
 
         // Track intermediate activity for progress updates
         if (event.type === 'assistant') {
-          const toolUse = Array.isArray(event.content)
-            ? event.content.find(b => b.type === 'tool_use')
-            : null;
+          // Extract streaming text from content blocks.
+          // Claude CLI sends assistant events with message.content array;
+          // each event contains only its own blocks (not accumulated).
+          const content = Array.isArray(event.message?.content)
+            ? event.message.content
+            : Array.isArray(event.content)
+              ? event.content
+              : [];
+          for (const block of content) {
+            if (block.type === 'text' && block.text) {
+              this._streamedText += block.text;
+            } else if (block.type === 'tool_use') {
+              this._streamedText += `\n\n> 🔧 _Using ${block.name || 'tool'}..._\n\n`;
+            }
+          }
+          if (this._onStream && this._streamedText) {
+            this._onStream(this._streamedText);
+          }
+
+          const toolUse = content.find(b => b.type === 'tool_use');
           this._lastActivity = {
             type: toolUse ? 'tool_use' : 'thinking',
             tool: toolUse?.name || null,
@@ -648,6 +671,8 @@ class ClaudeProcess {
           this._status = 'idle';
           this._busySince = null;
           this._lastActivity = null;
+          this._onStream = null;
+          this._streamedText = '';
 
           if (this._pendingResolve) {
             const resolve = this._pendingResolve;
@@ -672,6 +697,8 @@ class ClaudeProcess {
 
     this._process = null;
     this._stdin = null;
+    this._onStream = null;
+    this._streamedText = '';
 
     // Flush any remaining buffered output before rejecting
     if (this._stdoutBuf.trim()) {
@@ -722,6 +749,8 @@ class ClaudeProcess {
   /** Stop the process and mark as stopped (won't accept new messages). */
   async stop() {
     this._status = 'stopped';
+    this._onStream = null;
+    this._streamedText = '';
 
     if (!this._process) return;
 
@@ -756,6 +785,8 @@ class ClaudeProcess {
     this._pendingResolve = null;
     this._pendingReject = null;
     this._interrupted = false;
+    this._onStream = null;
+    this._streamedText = '';
   }
 
   info() {
@@ -2227,6 +2258,105 @@ async function sendReplyToFeishu(channel, chatId, replyText, replyCtx) {
   }
 }
 
+/**
+ * Process a Claude message and stream the reply to Feishu.
+ *
+ * Uses Feishu's native streaming card (typewriter effect + auto-rollover
+ * for content exceeding 30KB). Falls back to non-streaming send
+ * (sendReplyToFeishu) if the stream fails to start.
+ *
+ * @param {ClaudeProcess} claude
+ * @param {string} text - user message to send to Claude
+ * @param {object} channel - LarkChannel instance
+ * @param {string} chatId
+ * @param {{ incomingMessageId?: string, reactionId?: string|null }} replyCtx
+ * @returns {Promise<{text:string,sessionId:string,costUsd:number,interrupted?:boolean}|null>}
+ */
+async function processAndReply(claude, text, channel, chatId, replyCtx) {
+  const { incomingMessageId } = replyCtx || {};
+
+  const streamOpts = incomingMessageId ? { replyTo: incomingMessageId } : {};
+  let cardCreated = false;
+  let finalResult = null;
+
+  try {
+    await channel.stream(chatId, {
+      markdown: async (controller) => {
+        cardCreated = true;
+
+        finalResult = await claude.sendMessage(text, {
+          onStream: (accumulatedText) => {
+            // Strip media references for display
+            const { text: cleanText } = parseMediaLines(accumulatedText);
+            const displayText = stripMarkdownLocalMediaRefs(cleanText);
+            if (displayText) {
+              controller.setContent(displayText).catch(() => {});
+            }
+          },
+        });
+
+        // Final update with clean result text
+        let finalDisplayText;
+        if (finalResult?.interrupted) {
+          finalDisplayText = '⚡ 当前处理已被打断';
+        } else {
+          const rawText = String(finalResult?.text ?? '');
+          const parsed = parseMediaLines(rawText);
+          finalDisplayText = stripMarkdownLocalMediaRefs(parsed.text);
+          if (finalDisplayText.endsWith('NO_REPLY')) {
+            finalDisplayText = finalDisplayText.replace(/\s*NO_REPLY\s*$/g, '').trim();
+          }
+          if (!finalDisplayText.trim()) {
+            const costNote = finalResult?.costUsd > 0 ? ` ($${finalResult.costUsd})` : '';
+            finalDisplayText = `✅ 已执行（无输出）${costNote}`;
+          }
+        }
+        controller.setContent(finalDisplayText);
+      },
+    }, streamOpts);
+  } catch (e) {
+    if (!cardCreated) {
+      // Stream failed to start — fall back to non-streaming send
+      console.warn('[WARN] stream failed to start, falling back:', e?.message || String(e));
+      try {
+        const result = await claude.sendMessage(text);
+        const replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
+        await sendReplyToFeishu(channel, chatId, replyText, { incomingMessageId });
+        return result;
+      } catch (e2) {
+        await sendReplyToFeishu(channel, chatId, `（系统出错）${e2?.message || String(e2)}`, { incomingMessageId });
+        return null;
+      }
+    }
+    // Stream started but producer failed — SDK already showed error in card
+    console.error('[WARN] stream failed after card creation:', e?.message || String(e));
+  }
+
+  // Send media files from the final result (after stream completes)
+  if (finalResult?.text && !finalResult?.interrupted) {
+    const rawText = String(finalResult.text);
+    const parsed = parseMediaLines(rawText);
+    let mediaUrls = parsed.mediaUrls || [];
+    const mdPaths = extractMarkdownLocalMediaPaths(parsed.text);
+    if (mdPaths.length > 0) {
+      for (const pth of mdPaths) {
+        const fp = path.resolve(pth);
+        if (isAllowedOutboundPath(fp)) mediaUrls.push(fp);
+      }
+    }
+    mediaUrls = [...new Set(mediaUrls)].slice(0, 4);
+    for (const u of mediaUrls) {
+      try {
+        await uploadAndSendMedia(channel.rawClient, chatId, u, undefined);
+      } catch (e) {
+        console.error(`[WARN] media send failed after stream: ${e?.message || String(e)}`);
+      }
+    }
+  }
+
+  return finalResult;
+}
+
 async function drainQueue(pm, alias) {
   const proj = pm.getProject(alias);
   if (!proj?.started) return;
@@ -2250,22 +2380,21 @@ async function drainQueue(pm, alias) {
       }, thresholdMs)
     : null;
 
-  let replyText = '';
   try {
-    const result = await proj.claude.sendMessage(text);
-    replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
-    if (!replyText.trim()) {
-      const costNote = result?.costUsd > 0 ? ` ($${result.costUsd})` : '';
-      replyText = `✅ 已执行（无输出）${costNote}`;
+    // Clear timer and remove any already-added reaction BEFORE streaming
+    // (the streaming card's "Thinking..." state replaces the reaction indicator)
+    if (timer) clearTimeout(timer);
+    if (incomingMessageId && reactionId) {
+      await removeReaction(channel.rawClient, incomingMessageId, reactionId);
     }
+    await processAndReply(proj.claude, text, channel, chatId, { incomingMessageId });
   } catch (e) {
-    replyText = `（系统出错）${e?.message || String(e)}`;
+    console.error(`[ERROR] drainQueue: ${e?.message || String(e)}`);
   } finally {
     done = true;
     if (timer) clearTimeout(timer);
   }
 
-  await sendReplyToFeishu(channel, chatId, replyText, { incomingMessageId, reactionId });
   await drainQueue(pm, alias);
 }
 
@@ -2334,7 +2463,7 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
         text = cleaned;
       }
 
-      // Process asynchronously (same logic as before)
+      // Process asynchronously
       setImmediate(async () => {
         let reactionId = null;
         let done = false;
@@ -2347,7 +2476,8 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
               }, thresholdMs)
             : null;
 
-        let replyText = '';
+        // replyText: null = already sent via streaming; string = pending sendReplyToFeishu
+        let replyText = null;
         let queued = false;
         try {
           const trimmed = String(text || '').trim();
@@ -2388,7 +2518,7 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
                 if (r) {
                   replyText = String(r.text ?? '');
                 } else {
-                  // Unknown slash command — pass through to Claude Code
+                  // Unknown slash command — pass through to Claude Code (streaming)
                   const proj = pm.getProject(alias);
                   if (!proj || !proj.started) {
                     replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
@@ -2399,12 +2529,13 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
                     if (had) replyText += '\n（已替换之前排队的消息）';
                     queued = true;
                   } else {
-                    const result = await proj.claude.sendMessage(trimmed);
-                    replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
-                    if (!replyText.trim()) {
-                      const costNote = result?.costUsd > 0 ? ` ($${result.costUsd})` : '';
-                      replyText = `✅ ${trimmed.split(/\s/)[0]} 已执行${costNote}`;
+                    // Stream the reply to Feishu
+                    if (timer) clearTimeout(timer);
+                    if (messageId && reactionId) {
+                      await removeReaction(channel.rawClient, messageId, reactionId);
                     }
+                    await processAndReply(proj.claude, trimmed, channel, chatId, { incomingMessageId: messageId });
+                    replyText = null; // already sent via streaming
                   }
                 }
               }
@@ -2427,12 +2558,13 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
                 if (had) replyText += '\n（已替换之前排队的消息）';
                 queued = true;
               } else {
-                const result = await proj.claude.sendMessage(fullText);
-                replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
-                if (!replyText.trim()) {
-                  const costNote = result?.costUsd > 0 ? ` ($${result.costUsd})` : '';
-                  replyText = `✅ 已执行（无输出）${costNote}`;
+                // Stream the reply to Feishu
+                if (timer) clearTimeout(timer);
+                if (messageId && reactionId) {
+                  await removeReaction(channel.rawClient, messageId, reactionId);
                 }
+                await processAndReply(proj.claude, fullText, channel, chatId, { incomingMessageId: messageId });
+                replyText = null; // already sent via streaming
               }
             }
           }
@@ -2443,7 +2575,10 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
           if (timer) clearTimeout(timer);
         }
 
-        await sendReplyToFeishu(channel, chatId, replyText, { incomingMessageId: messageId, reactionId });
+        // Send non-streaming reply if needed
+        if (replyText !== null) {
+          await sendReplyToFeishu(channel, chatId, replyText, { incomingMessageId: messageId, reactionId });
+        }
 
         if (!queued) {
           await drainQueue(pm, alias);
