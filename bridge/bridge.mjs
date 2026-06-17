@@ -2291,6 +2291,9 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
 
         // Periodically update the placeholder with elapsed time and
         // activity info (tool name) while Claude hasn't produced text yet.
+        // Only call setContent when the progress text actually changes
+        // to avoid wasting Feishu streaming card edit budget (~50 edits/card).
+        let lastProgressText = '';
         const progressTimer = setInterval(() => {
           if (hasRealContent) {
             clearInterval(progressTimer);
@@ -2298,7 +2301,11 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
           }
           const progress = claude.progressText();
           if (progress) {
-            controller.setContent(`💭 ${progress}`).catch(() => {});
+            const newText = `💭 ${progress}`;
+            if (newText !== lastProgressText) {
+              lastProgressText = newText;
+              controller.setContent(newText).catch(() => {});
+            }
           }
         }, 1500);
 
