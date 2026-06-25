@@ -524,6 +524,7 @@ class ClaudeProcess {
     this._lastActivity = null;    // { type, tool, ts } from intermediate events
     this._onStream = null;        // callback(accumulatedText) for streaming
     this._streamedText = '';      // accumulated display text for streaming
+    this._hasAssistantText = false; // true once real answer text (not tool markers) streams
   }
 
   _spawn() {
@@ -588,6 +589,7 @@ class ClaudeProcess {
     this._lastActivity = { type: 'thinking', tool: null, ts: Date.now() };
     this._onStream = onStream;
     this._streamedText = '';
+    this._hasAssistantText = false;
 
     return new Promise((resolve, reject) => {
       this._pendingResolve = resolve;
@@ -648,6 +650,7 @@ class ClaudeProcess {
           for (const block of content) {
             if (block.type === 'text' && block.text) {
               this._streamedText += block.text;
+              this._hasAssistantText = true;
             } else if (block.type === 'tool_use') {
               this._streamedText += `\n\n> 🔧 _Using ${block.name || 'tool'}..._\n\n`;
             }
@@ -2289,17 +2292,23 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
         let hasRealContent = false;
         controller.setContent('💭 正在思考…').catch(() => {});
 
-        // Periodically update the placeholder with activity info
-        // (tool name) while Claude hasn't produced text yet.
-        // Only call setContent when the ACTIVITY changes (tool starts/stops),
-        // not on every tick just because elapsed seconds changed — that
-        // would burn through the Feishu streaming card edit budget (~50).
+        // Process card shows ONLY progress (thinking / tool activity), never
+        // partial answer text. Pushing partial text burned through the Feishu
+        // streaming card edit budget (~50 edits/card) and, when exhausted, the
+        // final setContent failed silently → the conclusion never showed.
+        // Now edits happen only on tool-type transitions (≪ tool call count),
+        // so the budget is plenty for the final setContent at the end.
+        // PROGRESS_EDIT_CAP reserves headroom: stop updating progress after this
+        // many edits so the final setContent always has budget left.
+        const PROGRESS_EDIT_CAP = 30;
+        let progressEditCount = 0;
         let lastActivityKey = '';
         const progressTimer = setInterval(() => {
           if (hasRealContent) {
             clearInterval(progressTimer);
             return;
           }
+          if (progressEditCount >= PROGRESS_EDIT_CAP) return;
           const act = claude._lastActivity;
           if (act) {
             // Key = activity type + tool name (ignore timestamp)
@@ -2308,64 +2317,31 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
               lastActivityKey = key;
               const progress = claude.progressText();
               if (progress) {
+                progressEditCount++;
                 controller.setContent(`💭 ${progress}`).catch(() => {});
               }
             }
           }
         }, 1500);
 
-        // Throttle onStream updates to avoid exhausting Feishu streaming
-        // card edit budget (~50 edits/card). Only push to the card when:
-        // 1) the display text actually changed, AND
-        // 2) enough time has elapsed since the last setContent call.
-        // A pending update is flushed by a lightweight timer so the
-        // user still sees near-real-time progress without every single
-        // assistant event hitting the card.
-        const STREAM_THROTTLE_MS = 2000;
-        let lastStreamText = '';
-        let lastStreamTime = 0;
-        let pendingStreamUpdate = null;
-        const streamFlushTimer = setInterval(() => {
-          if (pendingStreamUpdate) {
-            const txt = pendingStreamUpdate;
-            pendingStreamUpdate = null;
-            controller.setContent(txt).catch(() => {});
-          }
-        }, STREAM_THROTTLE_MS);
-
         try {
           finalResult = await claude.sendMessage(text, {
-            onStream: (accumulatedText) => {
-              // Strip media references for display
-              const { text: cleanText } = parseMediaLines(accumulatedText);
-              const displayText = stripMarkdownLocalMediaRefs(cleanText);
-              if (!displayText) return;
+            // onStream no longer pushes partial text to the card. We only use
+            // it to detect when real answer text starts (vs tool markers) so
+            // we can switch the card to a "generating" marker once. Tool
+            // progress is already handled by progressTimer above.
+            onStream: () => {
+              if (hasRealContent || !claude._hasAssistantText) return;
               hasRealContent = true;
-
-              // Skip if content hasn't changed
-              if (displayText === lastStreamText) return;
-              lastStreamText = displayText;
-
-              const now = Date.now();
-              if (now - lastStreamTime >= STREAM_THROTTLE_MS) {
-                // Enough time elapsed — push immediately
-                lastStreamTime = now;
-                pendingStreamUpdate = null;
-                controller.setContent(displayText).catch(() => {});
-              } else {
-                // Too soon — defer to next flush timer tick
-                pendingStreamUpdate = displayText;
+              clearInterval(progressTimer);
+              if (progressEditCount < PROGRESS_EDIT_CAP) {
+                progressEditCount++;
+                controller.setContent('✍️ 正在生成回复…').catch(() => {});
               }
             },
           });
         } finally {
           clearInterval(progressTimer);
-          clearInterval(streamFlushTimer);
-          // Flush any pending update that was deferred by throttle
-          if (pendingStreamUpdate) {
-            controller.setContent(pendingStreamUpdate).catch(() => {});
-            pendingStreamUpdate = null;
-          }
         }
 
         // Final update with clean result text
