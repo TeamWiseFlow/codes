@@ -2323,12 +2323,11 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
         const turnStartAt = Date.now();
         let lastHeartbeatAt = turnStartAt;
         const progressTimer = setInterval(() => {
-          if (hasRealContent) {
-            clearInterval(progressTimer);
-            return;
-          }
-          // Dense progress edits on tool transitions, until the cap.
-          if (progressEditCount < PROGRESS_EDIT_CAP) {
+          // Dense progress edits on tool transitions, until the cap or until
+          // real answer text starts. Process card shows ONLY progress, never
+          // partial answer text (pushing partial text burned the ~50-edit/card
+          // budget and left nothing for the final setContent).
+          if (!hasRealContent && progressEditCount < PROGRESS_EDIT_CAP) {
             const act = claude._lastActivity;
             if (act) {
               // Key = activity type + tool name (ignore timestamp)
@@ -2344,13 +2343,22 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
               }
             }
           }
-          // Keep-alive heartbeat (runs even after the progress cap, and even
-          // when there's no tool activity at all — e.g. pure thinking).
+          // Keep-alive heartbeat: PATCH every ~60s for the ENTIRE turn
+          // (regardless of hasRealContent) so Feishu never auto-closes the
+          // streaming card. Critical: the heartbeat must NOT be gated on
+          // !hasRealContent — a model often emits a sentence of text, THEN
+          // runs a long tool phase, THEN produces the final answer. If the
+          // heartbeat stopped once text appeared, the long tool phase would
+          // silence the card → Feishu 10min auto-close → final conclusion
+          // PATCH hits a closed card (200 but not rendered) → silent loss.
+          // 60s is sparse enough that the ~50-edit/card budget lasts ~50min
+          // before rollover kicks in.
           const now = Date.now();
           if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
             lastHeartbeatAt = now;
             const elapsedMin = Math.max(1, Math.round((now - turnStartAt) / 60000));
             controller.setContent(`⏳ 仍在处理…（已 ${elapsedMin} 分钟）`).catch(() => {});
+            console.warn('[concl] heartbeat min=%d seq=%d hasRealContent=%s', elapsedMin, controller.sequence, hasRealContent);
           }
         }, 1500);
 
@@ -2363,10 +2371,13 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
             onStream: () => {
               if (hasRealContent || !claude._hasAssistantText) return;
               hasRealContent = true;
-              clearInterval(progressTimer);
+              // Note: do NOT clearInterval(progressTimer) here — the heartbeat
+              // must keep running (see comment in progressTimer). hasRealContent
+              // already stops the dense progress edits above.
               if (progressEditCount < PROGRESS_EDIT_CAP) {
                 progressEditCount++;
                 controller.setContent('✍️ 正在生成回复…').catch(() => {});
+                lastHeartbeatAt = Date.now();
               }
             },
           });
