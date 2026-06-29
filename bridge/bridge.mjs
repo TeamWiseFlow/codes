@@ -2412,7 +2412,11 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
             lastHeartbeatAt = now;
             const elapsedMin = Math.max(1, Math.round((now - turnStartAt) / 60000));
             controller.setContent(`⏳ 仍在处理…（已 ${elapsedMin} 分钟）`).catch(() => {});
-            console.warn('[concl] heartbeat min=%d seq=%d hasRealContent=%s', elapsedMin, controller.sequence, hasRealContent);
+            // Log liveness sparsely: first tick + every 5 min. The PATCH still
+            // fires every 60s (keep-alive), we just don't log each one.
+            if (elapsedMin === 1 || elapsedMin % 5 === 0) {
+              console.warn('[concl] heartbeat min=%d seq=%d', elapsedMin, controller.sequence);
+            }
           }
         }, 1500);
 
@@ -2440,7 +2444,6 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
         }
 
         // Final update with clean result text
-        let _conclEmptyFallback = false;
         if (finalResult?.interrupted) {
           finalDisplayText = '⚡ 当前处理已被打断';
         } else {
@@ -2453,58 +2456,37 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
           if (!finalDisplayText.trim()) {
             const costNote = finalResult?.costUsd > 0 ? ` ($${finalResult.costUsd})` : '';
             finalDisplayText = `✅ 已执行（无输出）${costNote}`;
-            _conclEmptyFallback = true;
           }
         }
-        // [concl] diagnostic: did we actually get a conclusion from Claude?
-        console.warn(
-          '[concl] finalResult: interrupted=%s textLen=%d costUsd=%s | finalDisplayText len=%d emptyFallback=%s head=%j tail=%j',
-          !!finalResult?.interrupted,
-          String(finalResult?.text ?? '').length,
-          finalResult?.costUsd,
-          finalDisplayText.length,
-          _conclEmptyFallback,
-          finalDisplayText.slice(0, 80),
-          finalDisplayText.slice(-80),
-        );
         // Best-effort final push. The SDK schedules this through its throttle
         // queue; if the underlying PUT fails (e.g. ECONNRESET) the SDK swallows
         // the error and flips `streamingFailed`. We detect that below and
         // re-deliver via a plain message so the conclusion is never lost.
         try {
-          console.warn('[concl] calling setContent len=%d', finalDisplayText.length);
           await controller.setContent(finalDisplayText);
-          console.warn('[concl] setContent returned ok, controller.content len=%d cardId=%s', controller.content?.length, controller.cardId);
         } catch (e) {
           console.warn('[stream] final setContent threw:', e?.message || String(e));
         }
       },
     }, streamOpts);
 
-    // [concl] diagnostic: inspect SDK controller state AFTER completeTerminal.
-    // This is the key signal: if content===finalDisplayText and streamingFailed
-    // is false and seq>0, the SDK DID patch the conclusion → issue is Feishu
-    // client render (fold/collapse). If content is still the progress marker,
-    // the final setContent was lost. If streamingFailed, a PATCH threw.
+    // [concl] one concise line per turn with the signals that matter for
+    // diagnosing lost conclusions: did Claude produce text, did the SDK patch
+    // it (seq>0, matches), did a PATCH throw (streamingFailed), did it
+    // rollover or exceed the element limit.
     if (streamController) {
       const sc = streamController;
       const scContent = String(sc.content || '');
       console.warn(
-        '[concl] post-stream: streamingFailed=%s contentLen=%d contentHead=%j cardId=%s seq=%d rollovers=%d msgId=%s maxChars=%d overLimit=%s',
-        sc.streamingFailed,
-        scContent.length,
-        scContent.slice(0, 80),
-        sc.cardId,
+        '[concl] turn end: interrupted=%s textLen=%d finalLen=%d seq=%d streamingFailed=%s matches=%s rollovers=%d overLimit=%s',
+        !!finalResult?.interrupted,
+        String(finalResult?.text ?? '').length,
+        (finalDisplayText || '').length,
         sc.sequence,
-        sc.rolloverMessageIds?.length,
-        sc._messageId,
-        sc.maxChars,
-        scContent.length > (sc.maxChars || 30000),
-      );
-      console.warn(
-        '[concl] finalDisplayText len=%d matchesControllerContent=%s',
-        finalDisplayText?.length,
+        sc.streamingFailed,
         scContent === finalDisplayText,
+        sc.rolloverMessageIds?.length,
+        scContent.length > (sc.maxChars || 30000),
       );
     }
 
