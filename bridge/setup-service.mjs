@@ -113,8 +113,10 @@ RestartSec=5
 Environment=HOME=${HOME}
 Environment=PATH=${HOME}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 ${envFileLine}
-StandardOutput=append:${HOME}/.codes/logs/feishu-bridge.out.log
-StandardError=append:${HOME}/.codes/logs/feishu-bridge.err.log
+# The bridge writes its own rotating log files in ~/.codes/logs (in-process
+# size rotation). stdout/stderr go to the journal as a crash fallback.
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=default.target

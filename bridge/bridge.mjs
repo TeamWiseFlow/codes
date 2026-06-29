@@ -32,13 +32,67 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { spawn, execSync } from 'node:child_process';
+import util from 'node:util';
 
-// ─── Console timestamp patch ──────────────────────────────────
+// ─── Console timestamp + rotating-file logging ─────────────────
+// loguru-style size rotation, zero deps, in-process: console.* is redirected
+// to rotating files in ~/.codes/logs (roll at MAX_BYTES, keep MAX_FILES
+// generations). systemd ships stdout/stderr to the journal (crash fallback);
+// it no longer appends to these files — the bridge owns them now, so it can
+// rotate them without fighting systemd's held fd.
 {
   const ts = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
+  // Baseline: timestamp-prefixed REAL console → systemd journal. Always
+  // installed first; if rotating-file setup throws, this stays in effect so
+  // we never lose logging entirely. Crash output also lands here.
+  const real = {
+    log: console.log.bind(console), info: console.info.bind(console),
+    warn: console.warn.bind(console), error: console.error.bind(console),
+  };
   for (const level of ['log', 'error', 'warn', 'info']) {
-    const orig = console[level].bind(console);
-    console[level] = (...args) => orig(`[${ts()}]`, ...args);
+    console[level] = (...args) => real[level](`[${ts()}]`, ...args);
+  }
+
+  try {
+    const LOG_DIR = process.env.FEISHU_BRIDGE_LOG_DIR || path.join(os.homedir(), '.codes', 'logs');
+    const MAX_BYTES = parseInt(process.env.FEISHU_BRIDGE_LOG_MAX_BYTES || String(20 * 1024 * 1024), 10);
+    const MAX_FILES = parseInt(process.env.FEISHU_BRIDGE_LOG_MAX_FILES || '3', 10);
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+
+    const makeSink = (file) => {
+      let size = 0;
+      try { size = fs.statSync(file).size; } catch {}
+      const roll = () => {
+        for (let i = MAX_FILES - 1; i >= 1; i--) {
+          try { fs.renameSync(`${file}.${i}`, `${file}.${i + 1}`); } catch {}
+        }
+        try { fs.renameSync(file, `${file}.1`); } catch {}
+        size = 0;
+      };
+      // Roll a pre-existing oversized file before appending to it.
+      if (size >= MAX_BYTES) roll();
+      // Synchronous append: durable even on crash/process.exit (async
+      // createWriteStream would lose buffered lines on a fast exit). The
+      // bridge isn't log-chatty, so the sync cost is negligible.
+      return (str) => {
+        try {
+          fs.appendFileSync(file, str);
+          size += Buffer.byteLength(str);
+          if (size >= MAX_BYTES) roll();
+        } catch {
+          // best effort — logging must never crash the bridge
+        }
+      };
+    };
+
+    const sinkOut = makeSink(path.join(LOG_DIR, 'feishu-bridge.out.log'));
+    const sinkErr = makeSink(path.join(LOG_DIR, 'feishu-bridge.err.log'));
+    console.log = (...args) => sinkOut(`[${ts()}] ${util.format(...args)}\n`);
+    console.info = (...args) => sinkOut(`[${ts()}] ${util.format(...args)}\n`);
+    console.warn = (...args) => sinkErr(`[${ts()}] ${util.format(...args)}\n`);
+    console.error = (...args) => sinkErr(`[${ts()}] ${util.format(...args)}\n`);
+  } catch (e) {
+    real.error('[log] rotating-file setup failed, falling back to journal:', e?.message || String(e));
   }
 }
 
