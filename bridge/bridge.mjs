@@ -2342,6 +2342,8 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
   // Lifted into the outer scope so the catch block can fall back to a plain
   // message if the streaming card never received the final content.
   let finalDisplayText = null;
+  // Table-heavy conclusions bypass the streaming card (see below).
+  let tableHeavy = false;
 
   try {
     await channel.stream(chatId, {
@@ -2458,14 +2460,40 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
             finalDisplayText = `✅ 已执行（无输出）${costNote}`;
           }
         }
+        // Table-heavy conclusions blow past Feishu's per-card table limit →
+        // ErrCode 11310 "card table number over limit" → the card stops
+        // rendering mid-content and the user sees only the pre-table half
+        // (the table portion is silently lost). Detect up-front: for
+        // table-heavy conclusions, DON'T put the conclusion on the streaming
+        // card — finalize it to a marker and deliver the conclusion via a
+        // fresh non-streaming card below (which falls back to plain text on
+        // 11310, so the full text always reaches the user).
+        const TABLE_LIMIT = 2;
+        const tableCount = (finalDisplayText.match(/\n\|.+\|\n\|[-:| ]+\|/g) || []).length;
+        tableHeavy = tableCount > TABLE_LIMIT;
+
         // Best-effort final push. The SDK schedules this through its throttle
-        // queue; if the underlying PUT fails (e.g. ECONNRESET) the SDK swallows
-        // the error and flips `streamingFailed`. We detect that below and
-        // re-deliver via a plain message so the conclusion is never lost.
+        // queue; if the underlying PUT fails (e.g. ECONNRESET, 11310 table
+        // over limit) the SDK may swallow the error and flip `streamingFailed`
+        // — we detect that below and re-deliver via a plain message. If
+        // setContent itself throws, re-deliver immediately here too.
         try {
-          await controller.setContent(finalDisplayText);
+          if (tableHeavy) {
+            console.warn('[concl] table-heavy (%d tables) → skip streaming card, deliver via non-stream card', tableCount);
+            await controller.setContent('✅ 完成（见下方）');
+          } else {
+            await controller.setContent(finalDisplayText);
+          }
         } catch (e) {
           console.warn('[stream] final setContent threw:', e?.message || String(e));
+          // Card rejected the content (e.g. 11310 table over limit) —
+          // re-deliver the full conclusion as a fresh non-streaming card so
+          // nothing is lost.
+          try {
+            await sendReplyToFeishu(channel, chatId, finalDisplayText, { incomingMessageId });
+          } catch (e2) {
+            console.error('[concl] setContent-throw fallback failed:', e2?.message || String(e2));
+          }
         }
       },
     }, streamOpts);
@@ -2500,6 +2528,19 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
         await sendReplyToFeishu(channel, chatId, finalDisplayText ?? '', { incomingMessageId });
       } catch (e) {
         console.error('[stream] fallback plain message also failed:', e?.message || String(e));
+      }
+    }
+
+    // Table-heavy conclusions were kept off the streaming card (finalized to
+    // "✅ 完成（见下方）" above). Deliver the real conclusion now as a fresh
+    // non-streaming card — sendReplyToFeishu falls back to plain text on 11310,
+    // so the full content always reaches the user even if the card can't
+    // render the tables.
+    if (tableHeavy) {
+      try {
+        await sendReplyToFeishu(channel, chatId, finalDisplayText ?? '', { incomingMessageId });
+      } catch (e) {
+        console.error('[concl] table-heavy delivery failed:', e?.message || String(e));
       }
     }
     return finalResult;
