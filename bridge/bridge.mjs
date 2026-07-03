@@ -2363,17 +2363,23 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
         // Now edits happen only on tool-type transitions (≪ tool call count),
         // so the budget is plenty for the final setContent at the end.
         // PROGRESS_EDIT_CAP reserves headroom: stop updating progress after this
-        // many edits so the final setContent always has budget left.
-        const PROGRESS_EDIT_CAP = 30;
-        // Heartbeat: PATCH the card every ~60s for the whole turn so Feishu
+        // many edits so the final setContent always has budget left. Was 30, but
+        // tool-heavy turns (50+ tool calls, lots of type transitions) hit the cap
+        // and combined with heartbeats exhausted the per-card edit budget (~40,
+        // not 50 as once thought) → final conclusion PATCH silently dropped
+        // (Feishu returns 200, doesn't render, streamingFailed stays false).
+        // 15 keeps worst case ≈ 15 progress + 5 heartbeat/10min + 3 overhead
+        // ≈ 23, safely under the limit.
+        const PROGRESS_EDIT_CAP = 15;
+        // Heartbeat: PATCH the card every ~120s for the whole turn so Feishu
         // never auto-closes the streaming card (it does after 10min of
-        // inactivity). Without this, a long thinking/tool phase silences the
-        // card after the progress cap → Feishu auto-closes at 10min → the
-        // final conclusion setContent PATCH hits an already-closed card
+        // inactivity). 120s is still far inside the 10min window but halves the
+        // edit-budget pressure vs 60s. Without this, a long thinking/tool phase
+        // silences the card after the progress cap → Feishu auto-closes at 10min
+        // → the final conclusion setContent PATCH hits an already-closed card
         // (Feishu returns 200 but doesn't render) → silent loss
-        // (streamingFailed stays false). 60s is sparse enough that the
-        // ~50-edit/card budget lasts ~50min before rollover kicks in.
-        const HEARTBEAT_INTERVAL_MS = 60_000;
+        // (streamingFailed stays false).
+        const HEARTBEAT_INTERVAL_MS = 120_000;
         let progressEditCount = 0;
         let lastActivityKey = '';
         const turnStartAt = Date.now();
@@ -2468,7 +2474,15 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
         // card — finalize it to a marker and deliver the conclusion via a
         // fresh non-streaming card below (which falls back to plain text on
         // 11310, so the full text always reaches the user).
-        const TABLE_LIMIT = 2;
+        // Feishu's streaming card element silently fails to render markdown
+        // tables (PATCH returns 200 but the table content isn't applied — the
+        // card freezes on the previous marker). Was 2, but even 2 tables trigger
+        // the silent failure (observed 2026-07-03: a 2-table conclusion with
+        // seq=14, well under the edit budget, still didn't render). Any table →
+        // bypass the streaming card and deliver via a fresh non-streaming card
+        // (sendReplyToFeishu renders tables correctly, and falls back to plain
+        // text on 11310 so the full content always reaches the user).
+        const TABLE_LIMIT = 0;
         const tableCount = (finalDisplayText.match(/\n\|.+\|\n\|[-:| ]+\|/g) || []).length;
         tableHeavy = tableCount > TABLE_LIMIT;
 
