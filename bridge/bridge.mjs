@@ -2342,8 +2342,12 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
   // Lifted into the outer scope so the catch block can fall back to a plain
   // message if the streaming card never received the final content.
   let finalDisplayText = null;
-  // Table-heavy conclusions bypass the streaming card (see below).
-  let tableHeavy = false;
+  // Some conclusions bypass the streaming card and ship on a fresh
+  // non-streaming card instead (see below): table-heavy conclusions (Feishu's
+  // streaming element silently drops table content) and long turns (the
+  // streaming element has a hard lifetime — past ~10–47min, content PATCHes
+  // are silently dropped even with heartbeats keeping the card alive).
+  let bypassStreamingCard = false;
 
   try {
     await channel.stream(chatId, {
@@ -2484,7 +2488,18 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
         // text on 11310 so the full content always reaches the user).
         const TABLE_LIMIT = 0;
         const tableCount = (finalDisplayText.match(/\n\|.+\|\n\|[-:| ]+\|/g) || []).length;
-        tableHeavy = tableCount > TABLE_LIMIT;
+        const tableHeavy = tableCount > TABLE_LIMIT;
+        // Long turns: the streaming card element has a hard lifetime — past
+        // ~10–47min, content PATCHes are silently dropped even with heartbeats
+        // (observed 2026-07-03: a 47-min turn, seq=28, heartbeats firing every
+        // 120s throughout, matches=true, streamingFailed=false — yet the final
+        // conclusion never rendered). 8min is safely under the observed failure
+        // point; for turns past it, finalize the streaming card to a marker and
+        // deliver the conclusion on a fresh non-streaming card below.
+        const LONG_TURN_MS = 8 * 60_000;
+        const turnElapsedMs = Date.now() - turnStartAt;
+        const longTurn = turnElapsedMs > LONG_TURN_MS;
+        bypassStreamingCard = tableHeavy || longTurn;
 
         // Best-effort final push. The SDK schedules this through its throttle
         // queue; if the underlying PUT fails (e.g. ECONNRESET, 11310 table
@@ -2492,8 +2507,10 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
         // — we detect that below and re-deliver via a plain message. If
         // setContent itself throws, re-deliver immediately here too.
         try {
-          if (tableHeavy) {
-            console.warn('[concl] table-heavy (%d tables) → skip streaming card, deliver via non-stream card', tableCount);
+          if (bypassStreamingCard) {
+            console.warn('[concl] bypass streaming card (%s) → deliver via non-stream card; tables=%d elapsedMs=%d',
+              longTurn ? (tableHeavy ? 'long-turn+table-heavy' : 'long-turn') : 'table-heavy',
+              tableCount, turnElapsedMs);
             await controller.setContent('✅ 完成（见下方）');
           } else {
             await controller.setContent(finalDisplayText);
@@ -2545,16 +2562,16 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
       }
     }
 
-    // Table-heavy conclusions were kept off the streaming card (finalized to
-    // "✅ 完成（见下方）" above). Deliver the real conclusion now as a fresh
-    // non-streaming card — sendReplyToFeishu falls back to plain text on 11310,
-    // so the full content always reaches the user even if the card can't
-    // render the tables.
-    if (tableHeavy) {
+    // Conclusions that bypassed the streaming card (table-heavy or long-turn)
+    // were finalized to "✅ 完成（见下方）" above. Deliver the real conclusion
+    // now as a fresh non-streaming card — sendReplyToFeishu falls back to plain
+    // text on 11310, so the full content always reaches the user even if the
+    // card can't render the tables.
+    if (bypassStreamingCard) {
       try {
         await sendReplyToFeishu(channel, chatId, finalDisplayText ?? '', { incomingMessageId });
       } catch (e) {
-        console.error('[concl] table-heavy delivery failed:', e?.message || String(e));
+        console.error('[concl] bypass delivery failed:', e?.message || String(e));
       }
     }
     return finalResult;
