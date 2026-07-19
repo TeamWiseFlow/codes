@@ -3,7 +3,9 @@
 # AtomCode DLC 安装脚本
 #
 # 把 AtomCode 作为"可选 DLC 包"叠加到现有的 Feishu-Claude Bridge 部署上：
-#   1. 通过官方 install.sh 下载并安装 atomcode + atomcode-daemon 二进制
+#   1. 通过官方 install.sh 下载并安装 atomcode 主二进制
+#      （atomcode 内置 daemon 子命令：`atomcode daemon --port N` 启动 HTTP/SSE server，
+#       无需独立 atomcode-daemon 二进制）
 #   2. 把仓库里的 claude_enhance/ 强化件拷贝到 ~/.atomcode/ 对应目录
 #      （skills / agents / commands / contexts / rules / hooks）
 #   3. 不动 systemd 服务、不动 bridge.json —— 用户在 bridge.json 里把某个
@@ -54,12 +56,11 @@ info "FORCE_OVERWRITE= $FORCE_OVERWRITE"
 echo ""
 
 # ─── Phase 1: 下载并安装 atomcode 二进制 ─────────────────────────
-info "Phase 1/3: 下载并安装 atomcode (atomcode + atomcode-daemon)..."
+info "Phase 1/3: 下载并安装 atomcode ..."
 
 # 检查是否已安装
-if command -v atomcode &>/dev/null && command -v atomcode-daemon &>/dev/null; then
+if command -v atomcode &>/dev/null; then
   ok "atomcode 已安装: $(atomcode --version 2>/dev/null || echo 'unknown')"
-  ok "atomcode-daemon 已安装: $(atomcode-daemon --version 2>/dev/null || echo 'unknown')"
 else
   # 通过官方 install.sh 安装（curl | sh 模式）
   # 文档: https://atomgit.com/atomgit_atomcode/atomcode
@@ -73,11 +74,11 @@ else
   fi
 
   # 验证安装
-  if ! command -v atomcode &>/dev/null && ! command -v atomcode-daemon &>/dev/null; then
+  if ! command -v atomcode &>/dev/null; then
     # 尝试 ~/.local/bin
-    if [ -x "$HOME/.local/bin/atomcode" ] || [ -x "$HOME/.local/bin/atomcode-daemon" ]; then
+    if [ -x "$HOME/.local/bin/atomcode" ]; then
       export PATH="$HOME/.local/bin:$PATH"
-    elif [ -x "/usr/local/bin/atomcode" ] || [ -x "/usr/local/bin/atomcode-daemon" ]; then
+    elif [ -x "/usr/local/bin/atomcode" ]; then
       export PATH="/usr/local/bin:$PATH"
     fi
   fi
@@ -88,14 +89,11 @@ else
     fatal "atomcode 安装失败。请手动跑: curl -fsSL https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/install.sh | sh"
   fi
 
+  # atomcode 主二进制内置 daemon 子命令（atomcode daemon --port N），
+  # 飞书 bridge 通过 `atomcode daemon` 启动 HTTP/SSE server，无需独立 atomcode-daemon 二进制。
+  # 如果用户机器上碰巧装了独立 atomcode-daemon，bridge 也兼容（daemonBin 默认 'atomcode'）。
   if command -v atomcode-daemon &>/dev/null; then
-    ok "atomcode-daemon 安装成功"
-  else
-    warn "atomcode-daemon 未在 PATH 中找到"
-    warn "atomcode 安装时通常会同时装 atomcode-daemon，请检查 ~/.local/bin 或 /usr/local/bin"
-    warn "如果只有 atomcode 没有 atomcode-daemon，需要从源码编译:"
-    warn "  git clone https://atomgit.com/atomgit_atomcode/atomcode.git"
-    warn "  cd atomcode && cargo install --path crates/atomcode-daemon --locked"
+    ok "atomcode-daemon 也已安装（可选，bridge 用 atomcode daemon 子命令即可）"
   fi
 fi
 
@@ -234,12 +232,12 @@ if [ ! -f "$CONFIG_TOML" ]; then
 
 default_provider = "atomgit-glm-5.2"
 
-# AtomGit CodingPlan 免费 GLM-5.2（登录后通过 /login 自动配置 api_key）
+# AtomGit CodingPlan 免费 GLM-5.2（登录后通过 atomcode login 自动配置 api_key）
 [providers.atomgit-glm-5.2]
 type     = "openai"
 model    = "AtomGit-GLM-5.2"
 base_url = "https://open.atomgit.com/api/v1"
-# api_key 留空：登录后 /login 会自动写入 auth.json
+# api_key 留空：登录后 atomcode login 会自动写入 auth.json
 # 或者手动填 CodingPlan 提供的 api_key
 context_window = 64000
 
@@ -248,7 +246,7 @@ enabled = true
 dir = "~/.atomcode/datalog"
 CFGEOF
   ok "config.toml 已写入: $CONFIG_TOML"
-  warn "请通过 atomcode /login 登录 AtomGit 账号以激活免费 GLM-5.2"
+  warn "请通过 atomcode login 登录 AtomGit 账号以激活免费 GLM-5.2"
 else
   ok "config.toml 已存在，跳过（不覆盖用户配置）: $CONFIG_TOML"
 fi
@@ -261,7 +259,6 @@ echo "============================================"
 echo ""
 echo "  已安装内容:"
 echo "    atomcode 二进制:    $(command -v atomcode 2>/dev/null || echo '未在 PATH')"
-echo "    atomcode-daemon:    $(command -v atomcode-daemon 2>/dev/null || echo '未在 PATH')"
 echo "    atomcode 配置:      $ATOMCODE_HOME/"
 echo "    强化件来源:         $ENHANCE_SRC/"
 echo ""
@@ -269,7 +266,7 @@ echo "  下一步：在 bridge.json 里给想用 atomcode 的项目加:"
 echo ""
 echo '    "backend": "atomcode",'
 echo '    "atomcode": {'
-echo '      "daemonBin": "atomcode-daemon",'
+echo '      "daemonBin": "atomcode",'
 echo '      "approvalMode": "bypass",'
 echo '      "port": 13456,'
 echo '      "model": "AtomGit-GLM-5.2"'
@@ -279,8 +276,7 @@ echo "  然后重启 bridge:"
 echo "    systemctl --user restart codes-feishu-bridge.service"
 echo ""
 echo "  首次使用 atomcode 请登录 AtomGit 以激活免费 GLM-5.2:"
-echo "    atomcode   # 启动 TUI"
-echo "    /login     # OAuth 登录"
+echo "    atomcode login   # OAuth 登录（直接命令行执行）"
 echo ""
 echo "  卸载 DLC（保留 atomcode 二进制）:"
 echo "    rm -rf $ATOMCODE_HOME/skills $ATOMCODE_HOME/agents \\"

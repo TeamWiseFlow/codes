@@ -909,7 +909,7 @@ class AtomCodeDaemon {
    */
   constructor({
     workDir,
-    daemonBin = 'atomcode-daemon',
+    daemonBin = 'atomcode',
     port = null,
     approvalMode = 'bypass',
     sessionId = null,
@@ -959,14 +959,14 @@ class AtomCodeDaemon {
       this._port = await this._findFreePort(13456);
     }
 
+    // `atomcode daemon` subcommand: binds 127.0.0.1, only accepts
+    // --port / --idle-timeout / --client (no --host, no --approval-mode).
+    // Approval mode is set at runtime via POST /live/mode after health is green.
     const args = [
-      '--host', '127.0.0.1',
+      'daemon',
       '--port', String(this._port),
       '--idle-timeout', '0',      // bridge manages lifecycle; never auto-shut
     ];
-    if (this._approvalMode) {
-      args.push('--approval-mode', this._approvalMode);
-    }
 
     this._process = spawn(this._daemonBin, args, {
       cwd: this._workDir,
@@ -993,6 +993,7 @@ class AtomCodeDaemon {
         if (res.ok) {
           if (DEBUG) console.log(`[daemon] ready on port ${this._port}`);
           await this._pinProvider();
+          await this._setApprovalMode();
           return;
         }
       } catch {}
@@ -1026,6 +1027,30 @@ class AtomCodeDaemon {
       }
     } catch (err) {
       if (DEBUG) console.log(`[daemon] pin provider failed: ${err?.message || err}`);
+    }
+  }
+
+  /**
+   * Set the runtime approval mode via POST /live/mode.
+   * `atomcode daemon` subcommand doesn't accept --approval-mode, so we set it
+   * at runtime after the daemon is healthy. Values: 'build' | 'plan' | 'bypass'.
+   */
+  async _setApprovalMode() {
+    if (!this._approvalMode) return;
+    try {
+      const res = await fetch(`${this._baseUrl()}/live/mode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: this._approvalMode }),
+        signal: AbortSignal.timeout(3000),
+      });
+      if (res.ok && DEBUG) {
+        console.log(`[daemon] approval mode set to ${this._approvalMode}`);
+      } else if (DEBUG) {
+        console.log(`[daemon] /live/mode ${res.status} ${res.statusText}`);
+      }
+    } catch (err) {
+      if (DEBUG) console.log(`[daemon] set approval mode failed: ${err?.message || err}`);
     }
   }
 

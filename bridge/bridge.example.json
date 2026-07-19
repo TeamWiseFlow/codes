@@ -22,7 +22,7 @@
       },
       "backend": "atomcode",
       "atomcode": {
-        "daemonBin": "atomcode-daemon",
+        "daemonBin": "atomcode",
         "approvalMode": "bypass",
         "port": 13456,
         "model": "AtomGit-GLM-5.2"
