@@ -10,13 +10,26 @@
 
 🚀【2026.3.7】新增：每日自动备份，bridge 在指定时间自动将配置和会话记忆打包备份到本地，支持 `/backup` 命令随时手动触发
 
+🚀【2026.7.19】新增：**AtomCode DLC 后端**——bridge 现在支持双后端共存，每个项目可独立选择走 Claude Code CLI 还是 AtomCode daemon，互不干扰。
+
+> ### 🎁 AtomCode DLC：每 7 天免费领 Pro，白嫽 GLM-5.2
+>
+> [AtomCode](https://github.com/instructkr/atomcode) 是基于 Claude Code 的开源二进制，走 AtomGit 的 GLM-5.2 CodingPlan。**最大亮点：每 7 天可以领一次 Pro 会员，免费使用 GLM-5.2 模型**——不花一分钱就能有一个 7×24 的云端编码牛马，对国内网络环境也友好。
+>
+> DLC 作为可选包叠加到现有部署上，**不动 systemd 服务、不动 bridge.json 的 Claude 项目**：
+>
+> ```bash
+> # 一键安装 atomcode 二进制 + 强化件到 ~/.atomcode/
+> chmod +x install-atomcode-dlc.sh && ./install-atomcode-dlc.sh
+> ```
+>
+> 装完后在 `~/.codes/bridge.json` 里把某个项目的 `backend` 改成 `"atomcode"` 并重启 bridge 即可启用；卸载只需删 `~/.atomcode/` 下对应子目录。详见下方 [AtomCode DLC 安装](#atomcode-dlc-安装) 章节。
+
 🚀【2026.3.5】新增：延迟消息（计划消息），`/小时-分钟 “要延迟发送的消息”` （xx 小时 xxx 分钟后，内容发给 claude code）
 
 - 不需要 max/pro 订阅；
 - 因为不需要订阅，因此可以用国内的第三方代理方案，也可以直接用 minimax 或者 kimi、glm、qwen 等 coding 套餐；
 - 省不省钱的先不说，至少网络环境和账号这些麻烦不会存在了……
-
-顺便推荐一下，[Noin.ai](https://noin.ai/) 量大盘稳
 
 至于云端服务器，2C4G 足够了，腾讯云首单一年 79……当然因为本项目不需要公网 IP，所以你搞台二手电脑装个 ubuntu 扔家里或者办公室也是可以的……硬件几乎零成本。
 
@@ -153,6 +166,10 @@ node bridge.mjs
 | `projects.*.path` | 项目代码仓路径 | 必填 |
 | `projects.*.feishu.appId` | 飞书 App ID | 必填 |
 | `projects.*.feishu.appSecretPath` | Secret 文件路径 | 必填 |
+| `projects.*.backend` | 后端类型：`"claude"`（默认）或 `"atomcode"` | `"claude"` |
+| `projects.*.atomcode.daemonBin` | atomcode 二进制名/路径（仅 `backend:"atomcode"` 时生效） | `"atomcode"` |
+| `projects.*.atomcode.port` | daemon 监听端口 | 自动分配 |
+| `projects.*.atomcode.model` | 固定模型 | `"AtomGit-GLM-5.2"` |
 | `thinkingThresholdMs` | thinking 状态提示阈值（ms） | 2500 |
 | `claudePath` | Claude CLI 路径 | `"claude"` |
 | `debug` | 调试模式 | `false` |
@@ -287,6 +304,74 @@ A 处理完  →  回复 A 结果  →  自动开始处理 C
 /scheduled [alias]：查看当前待发送定时任务
 /unschedule <任务ID前缀> [alias]：撤回单个定时任务
 /unschedule all [alias]：撤回该项目全部定时任务
+
+## AtomCode DLC 安装
+
+AtomCode 作为**可选 DLC 包**叠加到现有 Feishu-Claude Bridge 部署上，不影响 Claude Code 后端。装完之后，bridge 就能在同一个进程里同时服务 Claude 项目和 AtomCode 项目，每个项目按 `backend` 字段独立选路。
+
+### 为什么用 AtomCode
+
+- **每 7 天免费领 Pro 会员**，直接用 GLM-5.2 模型，零成本拥有 7×24 云端编码牛马；
+- 国内网络环境友好，不依赖 Anthropic 官方 API 或海外代理；
+- 与 Claude Code 后端共存，付费项目继续走 Claude，免费项目走 AtomCode，互不干扰。
+
+### 一键安装
+
+```bash
+# 安装 atomcode 二进制 + 拷贝 claude_enhance 强化件到 ~/.atomcode/
+chmod +x install-atomcode-dlc.sh && ./install-atomcode-dlc.sh
+
+# 自定义强化件来源 / 安装目录
+ENHANCE_SRC=./claude_enhance ATOMCODE_HOME=~/.atomcode ./install-atomcode-dlc.sh
+
+# 强制覆盖已存在的强化件
+FORCE_OVERWRITE=1 ./install-atomcode-dlc.sh
+```
+
+脚本做的事：
+
+1. 通过官方 `install.sh` 下载 `atomcode` + `atomcode-daemon` 二进制到 `~/.local/bin/`；
+2. 把 `claude_enhance/` 下的 skills / agents / commands / contexts / rules / hooks 拷贝到 `~/.atomcode/` 对应目录；
+3. 写入最小 `~/.atomcode/config.toml`（`default_provider = atomgit-glm-5.2`），不覆盖已存在配置。
+
+**不改 systemd 服务，不动 `bridge.json`。**
+
+### 启用某个项目的 AtomCode 后端
+
+编辑 `~/.codes/bridge.json`，把目标项目的 `backend` 改成 `"atomcode"`，并可选指定端口/模型：
+
+```jsonc
+{
+  "xiaobei-dev": {
+    "path": "/home/wukong/xiaobei-dev",
+    "backend": "atomcode",          // 走 AtomCode daemon
+    "atomcode": {
+      "port": 13456,
+      "model": "AtomGit-GLM-5.2"
+    },
+    "feishu": { /* ... */ }
+  }
+}
+```
+
+改完重启 bridge 生效：
+
+```bash
+systemctl --user restart codes-feishu-bridge.service
+```
+
+### 卸载 DLC
+
+删除 `~/.atomcode/` 下对应子目录即可，并把 `bridge.json` 里该项目的 `backend` 改回 `"claude"`。
+
+### 排错：`spawn atomcode ENOENT`
+
+如果 bridge 起不来、journalctl 报 `spawn atomcode ENOENT`，是 systemd 服务 PATH 没包含 `~/.local/bin`（atomcode 二进制安装位置）。重新生成服务单元即可：
+
+```bash
+node bridge/setup-service.mjs   # 会把 ~/.local/bin 写进 PATH
+systemctl --user daemon-reload && systemctl --user restart codes-feishu-bridge.service
+```
 
 ## 服务部署
 
