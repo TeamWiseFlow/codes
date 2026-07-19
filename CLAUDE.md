@@ -30,8 +30,13 @@ bridge.mjs (单 Node.js 进程)
 │     ├── stdout: 读取事件流，type:"assistant" 增量推送流式文本，type:"result" 标记轮次结束
 │     ├── onStream: 流式回调，将累积文本实时推送给 Feishu streaming card
 │     └── respawn: 下次消息时以 --resume <session-id> 自动重启
-├── ProjectManager — 管理多个项目的 Claude 进程生命周期
-│     ├── init() — 加载配置，恢复会话，注册信号处理
+├── AtomCodeDaemon (可选后端，每个项目一个) — 管理 atomcode-daemon 子进程
+│     ├── start(): spawn atomcode-daemon --host 127.0.0.1 --port N, 轮询 /health, 通过 POST /live/provider 固定模型
+│     ├── sendMessage(): POST /live/message + 监听 /live SSE 流（text/reasoning/tool_start/tokens/permission_request 等 wire event）
+│     ├── interrupt(): POST /live/cancel
+│     └── stop(): SIGTERM → SIGKILL（5s 超时）
+├── ProjectManager — 管理多个项目的进程生命周期
+│     ├── init() — 按项目 backend 字段实例化 ClaudeProcess 或 AtomCodeDaemon，恢复会话，注册信号处理
 │     ├── startProject/stopProject — 按 alias 启停
 │     └── _saveSessions/_loadSessions — 持久化到 ~/.codes/bridge-sessions.json
 └── FeishuBot (每个项目一个) — 管理飞书 WebSocket 连接
@@ -40,6 +45,39 @@ bridge.mjs (单 Node.js 进程)
       ├── channel.stream({ markdown }) 流式回复（打字机效果 + 自动 rollover）
       └── channel.send 非流式回复（slash 命令等）
 ```
+
+### 双后端共存（Claude + AtomCode）
+
+bridge.json 里每个项目可选 `backend` 字段，决定该项目走 Claude Code CLI 还是 AtomCode daemon：
+
+| `backend` | 后端类 | 适用场景 | 默认模型 |
+|------------|--------|----------|----------|
+| `"claude"`（默认） | `ClaudeProcess` | 付费 Anthropic API、需要 Claude 生态 | 由 `claude` CLI 决定 |
+| `"atomcode"` | `AtomCodeDaemon` | 走 AtomGit 免费 GLM-5.2 CodingPlan | `AtomGit-GLM-5.2`（可改 `atomcode.model`） |
+
+两后端在同一个 bridge 进程里可以混合使用（每个项目一个独立子进程），互不干扰。`AtomCodeDaemon` 与 `ClaudeProcess` 暴露相同的鸭子类型接口（`sendMessage / interrupt / stop / restart / info / progressText`），`ProjectManager` 不感知差异。
+
+### AtomCode DLC 安装
+
+AtomCode 作为"可选 DLC 包"叠加到现有 Feishu-Claude Bridge 部署上，不影响 Claude Code 后端：
+
+```bash
+# 一键安装 atomcode 二进制 + 拷贝 claude_enhance 强化件到 ~/.atomcode/
+chmod +x install-atomcode-dlc.sh && ./install-atomcode-dlc.sh
+
+# 或通过环境变量自定义路径
+ENHANCE_SRC=./claude_enhance ATOMCODE_HOME=~/.atomcode ./install-atomcode-dlc.sh
+
+# 强制覆盖已存在的强化件
+FORCE_OVERWRITE=1 ./install-atomcode-dlc.sh
+```
+
+`install-atomcode-dlc.sh` 做的事：
+1. 通过官方 `install.sh` 下载 `atomcode` + `atomcode-daemon` 二进制
+2. 把 `claude_enhance/` 下的 skills / agents / commands / contexts / rules / hooks 拷贝到 `~/.atomcode/` 对应目录
+3. 写入最小 `~/.atomcode/config.toml`（default_provider = atomgit-glm-5.2），不覆盖已存在配置
+
+**不改 systemd 服务**，不动 `bridge.json`。用户在 `bridge.json` 里把某个项目的 `backend` 改成 `"atomcode"` 后重启 bridge 即可启用。卸载 DLC 只需删除 `~/.atomcode/` 下对应子目录。
 
 ## Key Files
 

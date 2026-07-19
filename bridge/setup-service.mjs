@@ -74,7 +74,7 @@ if (platform === 'darwin') {
       <key>HOME</key>
       <string>${HOME}</string>
       <key>PATH</key>
-      <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+      <string>${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 
     <key>StandardOutPath</key>
@@ -111,7 +111,7 @@ WorkingDirectory=${WORK_DIR}
 Restart=always
 RestartSec=5
 Environment=HOME=${HOME}
-Environment=PATH=${HOME}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=${HOME}/.npm-global/bin:${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
 ${envFileLine}
 # The bridge writes its own rotating log files in ~/.codes/logs (in-process
 # size rotation). stdout/stderr go to the journal as a crash fallback.

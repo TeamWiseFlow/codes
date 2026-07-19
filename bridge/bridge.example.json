@@ -13,6 +13,20 @@
         "appId": "cli_yyy",
         "appSecretPath": "~/.codes/secrets/backend_secret"
       }
+    },
+    "atomcode-project": {
+      "path": "/home/user/projects/atomcode-project",
+      "feishu": {
+        "appId": "cli_zzz",
+        "appSecretPath": "~/.codes/secrets/atomcode_secret"
+      },
+      "backend": "atomcode",
+      "atomcode": {
+        "daemonBin": "atomcode",
+        "approvalMode": "bypass",
+        "port": 13456,
+        "model": "AtomGit-GLM-5.2"
+      }
     }
   },
   "thinkingThresholdMs": 2500,
