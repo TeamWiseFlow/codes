@@ -875,6 +875,473 @@ class ClaudeProcess {
   }
 }
 
+// ─── AtomCodeDaemon ─────────────────────────────────────────────
+// Optional backend (per-project opt-in via bridge.json `backend: "atomcode"`).
+// Drives an `atomcode-daemon` HTTP process through the /live SSE protocol.
+// Mirrors the ClaudeProcess surface (sendMessage / interrupt / stop / restart /
+// info / progressText) so ProjectManager can treat both uniformly.
+//
+// Model pinning: AtomCode supports any OpenAI-compatible provider, but the
+// Feishu bridge use-case is "free CodingPlan GLM-5.2 from AtomGit". We pin
+// the default provider name to `AtomGit-GLM-5.2` (the AtomGit free-tier
+// model id) at daemon startup via POST /live/provider. /model slash command
+// can still override at runtime (see setProvider).
+//
+// Lifecycle:
+//   start()      → spawn atomcode-daemon --port N, poll /health, pin provider
+//   sendMessage() → POST /live/message + listen on /live SSE for TextDelta
+//   interrupt()   → POST /live/cancel
+//   stop()        → kill daemon process (SIGTERM → SIGKILL after 5s)
+
+// Default model id shipped by AtomGit CodingPlan (GLM-5.2 free tier).
+const ATOMCODE_DEFAULT_MODEL = 'AtomGit-GLM-5.2';
+
+class AtomCodeDaemon {
+  /**
+   * @param {{
+   *   workDir: string,
+   *   daemonBin?: string,
+   *   port?: number|null,
+   *   approvalMode?: 'build' | 'plan' | 'bypass',
+   *   sessionId?: string | null,
+   *   model?: string | null,
+   * }} opts
+   */
+  constructor({
+    workDir,
+    daemonBin = 'atomcode-daemon',
+    port = null,
+    approvalMode = 'bypass',
+    sessionId = null,
+    model = null,
+  }) {
+    this._workDir = workDir;
+    this._daemonBin = daemonBin;
+    this._port = port;            // null = auto-pick (13456 + scan)
+    this._approvalMode = approvalMode;
+    this._sessionId = sessionId;
+    this._model = model || ATOMCODE_DEFAULT_MODEL;  // pinned default
+    this._process = null;
+    this._costUsd = 0;
+    this._turnCount = 0;
+    this._status = 'idle';        // idle | busy | stopped
+    this._busySince = null;
+    this._lastActivity = null;
+    this._onStream = null;
+    this._streamedText = '';
+    this._hasAssistantText = false;
+    this._sseController = null;   // AbortController for the /live SSE fetch
+    this._pendingResolve = null;
+    this._pendingReject = null;
+    this._interrupted = false;
+    this._providerPinned = false; // true after first successful /live/provider
+  }
+
+  /** Base URL for the daemon's HTTP API. */
+  _baseUrl() {
+    return `http://127.0.0.1:${this._port}`;
+  }
+
+  /**
+   * Spawn the daemon process and wait for /health to respond.
+   * Idempotent: if already running, returns immediately.
+   * After health is green, pins the model provider via /live/provider.
+   */
+  async start() {
+    if (this._process && this._process.exitCode === null) {
+      // Already up — still (re)pin the provider if we haven't yet.
+      if (!this._providerPinned) await this._pinProvider();
+      return;
+    }
+
+    // Auto-pick a port starting from 13456 if none specified.
+    if (!this._port) {
+      this._port = await this._findFreePort(13456);
+    }
+
+    const args = [
+      '--host', '127.0.0.1',
+      '--port', String(this._port),
+      '--idle-timeout', '0',      // bridge manages lifecycle; never auto-shut
+    ];
+    if (this._approvalMode) {
+      args.push('--approval-mode', this._approvalMode);
+    }
+
+    this._process = spawn(this._daemonBin, args, {
+      cwd: this._workDir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    if (DEBUG) {
+      this._process.stdout.on('data', (c) => process.stderr.write(`[daemon:out] ${c}`));
+      this._process.stderr.on('data', (c) => process.stderr.write(`[daemon:err] ${c}`));
+    }
+    this._process.on('exit', (code, signal) => {
+      if (DEBUG) console.log(`[daemon] exited code=${code} signal=${signal}`);
+      this._process = null;
+      this._providerPinned = false;  // re-pin after respawn
+    });
+
+    // Poll /health until ready (max 15s).
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(`${this._baseUrl()}/health`, {
+          signal: AbortSignal.timeout(1000),
+        });
+        if (res.ok) {
+          if (DEBUG) console.log(`[daemon] ready on port ${this._port}`);
+          await this._pinProvider();
+          return;
+        }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    throw new Error(`atomcode-daemon did not become healthy on port ${this._port} within 15s`);
+  }
+
+  /**
+   * Pin the model provider via POST /live/provider.
+   * Silent best-effort — if the pin fails (e.g. provider name unknown to
+   * daemon), we leave it to the daemon's default and let /model surface it.
+   */
+  async _pinProvider() {
+    if (!this._model) {
+      this._providerPinned = true;
+      return;
+    }
+    try {
+      const res = await fetch(`${this._baseUrl()}/live/provider`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: this._model }),
+        signal: AbortSignal.timeout(3000),
+      });
+      if (res.ok) {
+        this._providerPinned = true;
+        if (DEBUG) console.log(`[daemon] provider pinned to ${this._model}`);
+      } else if (DEBUG) {
+        console.log(`[daemon] /live/provider ${res.status} ${res.statusText}`);
+      }
+    } catch (err) {
+      if (DEBUG) console.log(`[daemon] pin provider failed: ${err?.message || err}`);
+    }
+  }
+
+  /**
+   * Switch the active model at runtime. Called from /model slash command.
+   * @param {string} providerName
+   * @returns {Promise<boolean>} true on success
+   */
+  async setProvider(providerName) {
+    if (!providerName || typeof providerName !== 'string') return false;
+    await this.start();
+    try {
+      const res = await fetch(`${this._baseUrl()}/live/provider`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: providerName }),
+        signal: AbortSignal.timeout(3000),
+      });
+      if (res.ok) {
+        this._model = providerName;
+        this._providerPinned = true;
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  /** Scan for a free TCP port starting at `from`. */
+  async _findFreePort(from) {
+    for (let p = from; p < from + 200; p++) {
+      const busy = await new Promise((resolve) => {
+        const s = require('net').createServer();
+        s.once('error', () => resolve(true));
+        s.once('listening', () => { s.close(); resolve(false); });
+        s.listen(p, '127.0.0.1');
+      });
+      if (!busy) return p;
+    }
+    throw new Error(`No free port found in range ${from}..${from + 199}`);
+  }
+
+  /**
+   * Send a message to the AtomCode agent and wait for the turn to complete.
+   * @param {string} text
+   * @param {{ onStream?: ((accumulated: string) => void) }} [opts]
+   * @returns {Promise<{text: string, sessionId: string|null, costUsd: number}>}
+   */
+  async sendMessage(text, { onStream = null } = {}) {
+    if (this._status === 'stopped') throw new Error('AtomCodeDaemon is stopped');
+    if (this._status === 'busy') throw new Error('AtomCode is already processing a message');
+
+    await this.start();   // ensure daemon is up (respawn after crash)
+
+    this._status = 'busy';
+    this._busySince = Date.now();
+    this._lastActivity = { type: 'thinking', tool: null, ts: Date.now() };
+    this._onStream = onStream;
+    this._streamedText = '';
+    this._hasAssistantText = false;
+    this._interrupted = false;
+
+    return new Promise((resolve, reject) => {
+      this._pendingResolve = resolve;
+      this._pendingReject = reject;
+
+      const url = `${this._baseUrl()}/live?session_id=${encodeURIComponent(this._sessionId || '')}`;
+      this._sseController = new AbortController();
+
+      fetch(url, { signal: this._sseController.signal, headers: { Accept: 'text/event-stream' } })
+        .then((res) => {
+          if (!res.ok) throw new Error(`/live SSE failed: ${res.status} ${res.statusText}`);
+          return res.body.getReader();
+        })
+        .then((reader) => this._pumpSse(reader))
+        .catch((err) => {
+          if (this._interrupted) return;   // abort from interrupt() is expected
+          this._fail(err);
+        });
+
+      // Fire the message after the SSE stream is opening.
+      // The daemon creates/attaches the LiveSession lazily on first /live or /live/message.
+      const body = JSON.stringify({
+        message: text,
+        session_id: this._sessionId || undefined,
+      });
+      fetch(`${this._baseUrl()}/live/message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        signal: AbortSignal.timeout(30_000),
+      }).catch((err) => this._fail(err));
+    });
+  }
+
+  /** Read SSE chunks, split on `\n\n`, parse `data:` JSON lines. */
+  async _pumpSse(reader) {
+    let buf = '';
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += new TextDecoder().decode(value);
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const rawEvent = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const dataLine = rawEvent.split('\n').find((l) => l.startsWith('data:'));
+          if (!dataLine) continue;
+          const jsonStr = dataLine.slice(5).trimStart();
+          if (!jsonStr) continue;
+          try {
+            this._handleWireEvent(JSON.parse(jsonStr));
+          } catch (e) {
+            if (DEBUG) console.log(`[daemon:sse] parse error: ${e?.message || e}`);
+          }
+        }
+      }
+    } catch (err) {
+      if (!this._interrupted && err?.name !== 'AbortError') {
+        this._fail(err);
+      }
+    }
+  }
+
+  /** Dispatch one LiveWireEvent. */
+  _handleWireEvent(ev) {
+    switch (ev.type) {
+      case 'snapshot':
+        if (ev.session_id) this._sessionId = ev.session_id;
+        break;
+      case 'session_switched':
+        if (ev.session_id) this._sessionId = ev.session_id;
+        break;
+      case 'text':
+        this._streamedText += ev.content || '';
+        this._hasAssistantText = true;
+        if (this._onStream && this._streamedText) this._onStream(this._streamedText);
+        break;
+      case 'reasoning':
+        // Reasoning deltas are folded into the stream but marked.
+        this._streamedText += `\n\n> _${ev.content || ''}_\n\n`;
+        if (this._onStream && this._streamedText) this._onStream(this._streamedText);
+        break;
+      case 'tool_start':
+        this._lastActivity = { type: 'tool_use', tool: ev.name, ts: Date.now() };
+        this._streamedText += `\n\n> 🔧 _Using ${ev.name || 'tool'}..._\n\n`;
+        if (this._onStream) this._onStream(this._streamedText);
+        break;
+      case 'tool_result':
+        // Cost tracking is not exposed in /live wire events; leave _costUsd as-is.
+        break;
+      case 'tokens': {
+        // AtomCode daemon emits `tokens` wire events with prompt/completion/total.
+        // We don't have USD pricing for GLM-5.2 (free tier anyway), but we
+        // accumulate token counts into _costUsd as a *rough* proxy: store
+        // total tokens in the costUsd field (so /cost still shows something
+        // meaningful) — see /cost formatting in handleSlashCommand.
+        const total = Number(ev.total || 0);
+        if (total > 0) this._costUsd += total;
+        break;
+      }
+      case 'permission_request':
+        // In bypass mode the daemon auto-approves and never sends this.
+        // In build/plan mode we auto-approve here (bridge is non-interactive);
+        // users wanting interactive approval should keep approvalMode='bypass'
+        // or handle it via a future Feishu approval card.
+        this._respondPermission(ev.call_id, true).catch(() => {});
+        break;
+      case 'state':
+        // running=false marks turn end in many flows, but we also rely on
+        // the explicit terminal events below.
+        if (ev.running === false && this._status === 'busy') {
+          this._complete('');
+        }
+        break;
+      case 'command_output':
+        // Slash-command text output — surface as a streamed text chunk.
+        if (ev.text) {
+          this._streamedText += ev.text;
+          if (this._onStream) this._onStream(this._streamedText);
+        }
+        break;
+      case 'error':
+        this._fail(new Error(ev.message || 'daemon error'));
+        break;
+      case 'warning':
+        if (DEBUG) console.log(`[daemon:warn] ${ev.message}`);
+        break;
+      default:
+        if (DEBUG) console.log(`[daemon:sse] unhandled type=${ev.type}`);
+    }
+  }
+
+  /** POST /live/permission to approve/deny a pending tool call. */
+  async _respondPermission(callId, approved) {
+    await fetch(`${this._baseUrl()}/live/permission`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ call_id: callId, approved }),
+      signal: AbortSignal.timeout(5000),
+    });
+  }
+
+  /** Resolve the pending sendMessage promise with a result. */
+  _complete(text) {
+    if (this._status !== 'busy') return;
+    this._status = 'idle';
+    this._busySince = null;
+    this._lastActivity = null;
+    this._onStream = null;
+    this._streamedText = '';
+    this._sseController?.abort();
+    this._sseController = null;
+    if (this._pendingResolve) {
+      const resolve = this._pendingResolve;
+      this._pendingResolve = null;
+      this._pendingReject = null;
+      this._turnCount++;
+      resolve({ text, sessionId: this._sessionId, costUsd: 0 });
+    }
+  }
+
+  /** Reject the pending sendMessage promise. */
+  _fail(err) {
+    if (this._status !== 'busy') return;
+    this._status = 'idle';
+    this._busySince = null;
+    this._lastActivity = null;
+    this._onStream = null;
+    this._streamedText = '';
+    this._sseController?.abort();
+    this._sseController = null;
+    if (this._pendingReject) {
+      const reject = this._pendingReject;
+      this._pendingResolve = null;
+      this._pendingReject = null;
+      reject(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  /** Interrupt the current turn. Returns true if a turn was in progress. */
+  async interrupt() {
+    if (this._status !== 'busy') return false;
+    this._interrupted = true;
+    try {
+      await fetch(`${this._baseUrl()}/live/cancel`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(3000),
+      });
+    } catch {}
+    this._complete('');
+    return true;
+  }
+
+  async stop() {
+    this._status = 'stopped';
+    this._onStream = null;
+    this._streamedText = '';
+    this._sseController?.abort();
+    this._sseController = null;
+
+    if (this._pendingReject) {
+      const reject = this._pendingReject;
+      this._pendingResolve = null;
+      this._pendingReject = null;
+      reject(new Error('AtomCodeDaemon stopped'));
+    }
+
+    if (!this._process) return;
+    const proc = this._process;
+    this._process = null;
+    try { proc.kill('SIGTERM'); } catch {}
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        try { proc.kill('SIGKILL'); } catch {}
+        resolve();
+      }, 5000);
+      proc.on('exit', () => { clearTimeout(timeout); resolve(); });
+    });
+  }
+
+  /** Re-enable after stop (allow new messages). */
+  restart() {
+    this._status = 'idle';
+    this._pendingResolve = null;
+    this._pendingReject = null;
+    this._interrupted = false;
+    this._onStream = null;
+    this._streamedText = '';
+    this._process = null;   // start() will respawn
+    this._providerPinned = false;
+  }
+
+  info() {
+    return {
+      status: this._status,
+      pid: this._process?.pid || null,
+      sessionId: this._sessionId || null,
+      costUsd: Math.round(this._costUsd * 10000) / 10000,
+      turnCount: this._turnCount,
+      model: this._model || null,
+      backend: 'atomcode',
+    };
+  }
+
+  progressText() {
+    if (this._status !== 'busy' || !this._busySince) return null;
+    const elapsed = formatElapsed(Date.now() - this._busySince);
+    const act = this._lastActivity;
+    if (act?.type === 'tool_use' && act.tool) {
+      return `正在处理… ${elapsed} | 工具: ${act.tool}`;
+    }
+    return `正在思考… ${elapsed}`;
+  }
+}
+
 // ─── Bridge Config ───────────────────────────────────────────────
 
 function loadBridgeConfig() {
@@ -923,6 +1390,27 @@ function loadBridgeConfig() {
       process.exit(1);
     }
     proj.feishu.appSecretPath = resolvePath(proj.feishu.appSecretPath);
+
+    // Backend selection: "claude" (default, spawns claude CLI) or "atomcode"
+    // (spawns atomcode-daemon HTTP process, drives /live API).
+    // This is a per-project opt-in — mixed backends within one bridge process
+    // are supported (each project gets its own subprocess).
+    proj.backend = proj.backend || 'claude';
+    if (proj.backend !== 'claude' && proj.backend !== 'atomcode') {
+      console.error(
+        `[FATAL] Project "${alias}" backend must be "claude" or "atomcode" (got "${proj.backend}")`,
+      );
+      process.exit(1);
+    }
+    if (proj.backend === 'atomcode') {
+      const ac = proj.atomcode || {};
+      proj.atomcode = {
+        daemonBin: ac.daemonBin || 'atomcode-daemon',
+        port: ac.port != null ? Number(ac.port) : null,
+        approvalMode: ac.approvalMode || 'bypass',
+        model: ac.model || null,   // null = ATOMCODE_DEFAULT_MODEL pin
+      };
+    }
   }
 
   // Backup config (optional — set to false to disable)
@@ -977,11 +1465,24 @@ class ProjectManager {
 
     for (const [alias, proj] of Object.entries(this._config.projects)) {
       const sessionId = saved[alias]?.sessionId || null;
-      const claude = new ClaudeProcess({
-        workDir: proj.path,
-        claudePath: this._config.claudePath,
-        sessionId,
-      });
+      let claude;
+      if (proj.backend === 'atomcode') {
+        const ac = proj.atomcode || {};
+        claude = new AtomCodeDaemon({
+          workDir: proj.path,
+          daemonBin: ac.daemonBin,
+          port: ac.port,
+          approvalMode: ac.approvalMode,
+          model: ac.model,
+          sessionId,
+        });
+      } else {
+        claude = new ClaudeProcess({
+          workDir: proj.path,
+          claudePath: this._config.claudePath,
+          sessionId,
+        });
+      }
 
       // Restore accumulated stats
       if (saved[alias]?.costUsd) claude._costUsd = Number(saved[alias].costUsd) || 0;
@@ -992,7 +1493,25 @@ class ProjectManager {
         started: true,
         path: proj.path,
         feishuAppId: proj.feishu.appId,
+        backend: proj.backend,
       });
+
+      // AtomCodeDaemon spawns its daemon process eagerly so the first
+      // Feishu message has zero startup latency. ClaudeProcess spawns
+      // lazily on first sendMessage (no start() method).
+      if (typeof claude.start === 'function') {
+        try {
+          await claude.start();
+          console.log(
+            `[OK] AtomCode daemon started for "${alias}" on port ${claude._port}` +
+              (claude._model ? ` (model=${claude._model})` : ''),
+          );
+        } catch (err) {
+          console.error(
+            `[ERROR] Failed to start AtomCode daemon for "${alias}": ${err?.message || err}`,
+          );
+        }
+      }
     }
 
     // Auto-save sessions every 60s
