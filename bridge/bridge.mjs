@@ -930,6 +930,9 @@ class AtomCodeDaemon {
     this._onStream = null;
     this._streamedText = '';
     this._hasAssistantText = false;
+    this._finalText = '';         // text accumulated since the last tool_start;
+                                  // the post-tool tail = clean final answer
+                                  // (mirrors Claude's event.result semantics)
     this._sseController = null;   // AbortController for the /live SSE fetch
     this._pendingResolve = null;
     this._pendingReject = null;
@@ -1110,6 +1113,7 @@ class AtomCodeDaemon {
     this._onStream = onStream;
     this._streamedText = '';
     this._hasAssistantText = false;
+    this._finalText = '';
     this._interrupted = false;
 
     return new Promise((resolve, reject) => {
@@ -1172,6 +1176,17 @@ class AtomCodeDaemon {
       if (!this._interrupted && err?.name !== 'AbortError') {
         this._fail(err);
       }
+      return;
+    }
+    // Stream ended cleanly (done=true) without a terminal `state running=false`
+    // event. If we're still busy, the daemon closed the SSE response mid-turn
+    // (e.g. turn finished without emitting the terminal event, or the connection
+    // was reset). Without this fallback sendMessage() would never resolve and
+    // _status would stick on 'busy' forever, rejecting all new messages. Treat
+    // stream-end as turn-end with whatever final text we accumulated.
+    if (this._status === 'busy') {
+      if (DEBUG) console.log('[daemon:sse] stream ended without terminal event; completing turn');
+      this._complete(this._finalText);
     }
   }
 
@@ -1186,6 +1201,7 @@ class AtomCodeDaemon {
         break;
       case 'text':
         this._streamedText += ev.content || '';
+        this._finalText += ev.content || '';
         this._hasAssistantText = true;
         if (this._onStream && this._streamedText) this._onStream(this._streamedText);
         break;
@@ -1197,6 +1213,10 @@ class AtomCodeDaemon {
       case 'tool_start':
         this._lastActivity = { type: 'tool_use', tool: ev.name, ts: Date.now() };
         this._streamedText += `\n\n> 🔧 _Using ${ev.name || 'tool'}..._\n\n`;
+        // A tool_start means any text so far was process narration ("我先并行
+        // 查看…"), not the final answer. Drop it from _finalText so the turn-end
+        // card shows only the post-tool tail = clean conclusion (Claude parity).
+        this._finalText = '';
         if (this._onStream) this._onStream(this._streamedText);
         break;
       case 'tool_result':
@@ -1221,9 +1241,11 @@ class AtomCodeDaemon {
         break;
       case 'state':
         // running=false marks turn end in many flows, but we also rely on
-        // the explicit terminal events below.
+        // the explicit terminal events below. Resolve with _finalText (the
+        // post-tool tail) so the card lands the clean conclusion, not the
+        // full process narration + tool markers.
         if (ev.running === false && this._status === 'busy') {
-          this._complete('');
+          this._complete(this._finalText);
         }
         break;
       case 'command_output':
