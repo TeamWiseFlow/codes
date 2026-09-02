@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Feishu-Claude Bridge — Ubuntu 24.04 一键部署脚本
+# Feishu-Codex Bridge — Ubuntu 24.04 一键部署脚本
 #
 # 用法:
 #   curl -fsSL <url>/deploy.sh | bash
@@ -27,7 +27,7 @@ CODES_DIR="$HOME/codes"
 # ─── 检测环境 ─────────────────────────────────────────────────────
 echo ""
 echo "============================================"
-echo "  Feishu-Claude Bridge 一键部署"
+echo "  Feishu-Codex Bridge 一键部署"
 echo "  目标: Ubuntu 24.04"
 echo "============================================"
 echo ""
@@ -38,14 +38,14 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 # ─── Phase 1: 系统依赖 ────────────────────────────────────────────
-info "Phase 1/7: 安装系统依赖..."
+info "Phase 1/6: 安装系统依赖..."
 
 sudo apt-get update -qq
-sudo apt-get install -y -qq git curl jq tmux > /dev/null 2>&1
+sudo apt-get install -y -qq git curl jq tmux bubblewrap > /dev/null 2>&1
 ok "系统依赖已安装"
 
 # ─── Phase 2: Node.js ────────────────────────────────────────────
-info "Phase 2/7: 安装 Node.js ${NODE_MAJOR}.x..."
+info "Phase 2/6: 安装 Node.js ${NODE_MAJOR}.x..."
 
 if command -v node &>/dev/null; then
   ok "Node.js 已安装: $(node --version)"
@@ -55,7 +55,7 @@ else
   ok "Node.js $(node --version) 已安装"
 fi
 
-# 配置 npm 用户级全局目录（使 claude 命令在 PATH 中可用）
+# 配置 npm 用户级全局目录（使 codex 命令在 PATH 中可用）
 NPM_GLOBAL="$HOME/.npm-global"
 mkdir -p "$NPM_GLOBAL"
 npm config set prefix "$NPM_GLOBAL"
@@ -65,18 +65,19 @@ if ! grep -q '.npm-global/bin' "$HOME/.profile" 2>/dev/null; then
 fi
 export PATH="$NPM_GLOBAL/bin:$PATH"
 
-# ─── Phase 3: Claude Code CLI ────────────────────────────────────
-info "Phase 3/7: 安装 Claude Code CLI..."
+# ─── Phase 3: Codex CLI ──────────────────────────────────────────
+info "Phase 3/6: 安装 Codex CLI..."
 
-if command -v claude &>/dev/null; then
-  ok "Claude Code 已安装: $(claude --version 2>/dev/null || echo 'unknown')"
+if command -v codex &>/dev/null; then
+  ok "Codex 已安装: $(codex --version 2>/dev/null || echo 'unknown')"
 else
-  npm install -g @anthropic-ai/claude-code > /dev/null 2>&1
-  ok "Claude Code $(claude --version 2>/dev/null || echo '') 已安装"
+  npm install -g @openai/codex > /dev/null 2>&1
+  ok "Codex $(codex --version 2>/dev/null || echo '') 已安装"
 fi
+CODEX_BIN="$(command -v codex)"
 
 # ─── Phase 4: 克隆仓库 + 安装依赖 ────────────────────────────────
-info "Phase 4/7: 克隆仓库并安装依赖..."
+info "Phase 4/6: 克隆仓库并安装依赖..."
 
 if [ -d "$CODES_DIR" ]; then
   info "codes 目录已存在，执行 git pull..."
@@ -90,7 +91,7 @@ npm install --production > /dev/null 2>&1
 ok "bridge 依赖已安装"
 
 # ─── Phase 5: 交互式配置 ──────────────────────────────────────────
-info "Phase 5/7: 配置..."
+info "Phase 5/6: 配置..."
 
 echo ""
 echo "============================================"
@@ -98,25 +99,19 @@ echo "  现在需要你提供几个配置值"
 echo "============================================"
 echo ""
 
-# --- Claude Code 配置 ---
-echo -e "${BLUE}[1/3] Claude Code API 配置${NC}"
-echo "  你使用的是:"
-echo "    1) Anthropic 官方 API"
-echo "    2) 第三方代理 / 自部署 API"
-read -rp "  选择 (1/2) [1]: " API_CHOICE
-API_CHOICE=${API_CHOICE:-1}
-
-if [ "$API_CHOICE" = "1" ]; then
-  ANTHROPIC_AUTH_TOKEN=""
-  read -rsp "  请输入 Anthropic Auth Token (ANTHROPIC_AUTH_TOKEN): " ANTHROPIC_AUTH_TOKEN || true
-  echo ""
-  ANTHROPIC_BASE_URL=""
-else
-  read -rp "  请输入 API Base URL: " ANTHROPIC_BASE_URL
-  ANTHROPIC_AUTH_TOKEN=""
-  read -rsp "  请输入 Auth Token: " ANTHROPIC_AUTH_TOKEN || true
-  echo ""
-fi
+# --- 模型端点配置（OpenAI Responses 兼容） ---
+echo -e "${BLUE}[1/3] 模型端点配置（OpenAI Responses 兼容）${NC}"
+echo "  需要一个提供 /responses 端点的模型服务，例如:"
+echo "    - 阿里云百炼兼容模式: https://dashscope.aliyuncs.com/compatible-mode/v1"
+echo "    - 各类 OpenAI 兼容网关的 /v1 路径"
+read -rp "  Base URL (如 https://xxx/compatible-mode/v1): " MODEL_BASE_URL
+[ -n "$MODEL_BASE_URL" ] || fatal "Base URL 不能为空"
+MODEL_API_KEY=""
+read -rsp "  API Key: " MODEL_API_KEY || true
+echo ""
+[ -n "$MODEL_API_KEY" ] || fatal "API Key 不能为空"
+read -rp "  默认模型名 (如 glm-5.2 / qwen3.8-max) [glm-5.2]: " MODEL_NAME
+MODEL_NAME=${MODEL_NAME:-glm-5.2}
 
 # --- 飞书配置 ---
 echo ""
@@ -138,7 +133,7 @@ mkdir -p "$PROJECT_PATH"
 echo ""
 info "正在写入配置文件..."
 
-# ─── 写入配置 ───────────────────────────────��─────────────────────
+# ─── 写入配置 ─────────────────────────────────────────────────────
 mkdir -p "$HOME/.codes/secrets"
 mkdir -p "$HOME/.codes/logs"
 
@@ -147,7 +142,12 @@ echo -n "$FEISHU_APP_SECRET" > "$HOME/.codes/secrets/${PROJECT_ALIAS}_secret"
 chmod 600 "$HOME/.codes/secrets/${PROJECT_ALIAS}_secret"
 ok "飞书 secret 已写入"
 
-# bridge.json
+# 模型 API key（bridge 启动时自动加载）
+echo "CODEX_API_KEY=${MODEL_API_KEY}" > "$CODES_DIR/bridge/.env"
+chmod 600 "$CODES_DIR/bridge/.env"
+ok "模型 API key 已写入 bridge/.env"
+
+# bridge.json（providers + codexDefaults 由 bridge 生成为 ~/.codes/codex-home/config.toml）
 cat > "$HOME/.codes/bridge.json" << BRIDGEEOF
 {
   "projects": {
@@ -159,207 +159,27 @@ cat > "$HOME/.codes/bridge.json" << BRIDGEEOF
       }
     }
   },
-  "claudePath": "claude",
+  "providers": {
+    "default": {
+      "name": "default",
+      "baseUrl": "${MODEL_BASE_URL}",
+      "envKey": "CODEX_API_KEY",
+      "wireApi": "responses"
+    }
+  },
+  "codexDefaults": {
+    "model": "${MODEL_NAME}",
+    "provider": "default"
+  },
+  "codexPath": "${CODEX_BIN}",
   "debug": false
 }
 BRIDGEEOF
 chmod 600 "$HOME/.codes/bridge.json"
 ok "bridge.json 已写入: ~/.codes/bridge.json"
 
-# ─── Claude Code 配置 ─────────────────────────────────────────────
-if [ -d "$HOME/.claude" ] && [ -f "$HOME/.claude/settings.json" ]; then
-  ok "检测到已有 ~/.claude 配置，跳过"
-else
-  mkdir -p "$HOME/.claude"
-  cat > "$HOME/.claude/settings.json" << 'SETTINGSEOF'
-{
-  "model": "sonnet",
-  "effortLevel": "high",
-  "language": "简体中文"
-}
-SETTINGSEOF
-  ok "已创建最小 Claude Code 配置"
-
-  warn "请自行配置 Claude Code API 凭据 (ANTHROPIC_AUTH_TOKEN 等)"
-  warn "建议写入 ~/.profile 或 ~/.bashrc，或通过 claude login 登录"
-fi
-
-# 写入 bridge.env（供 systemd 服务读取）
-{
-  [ -n "$ANTHROPIC_BASE_URL" ] && echo "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}"
-  echo "DISABLE_AUTO_UPDATE=1"
-} > "$HOME/.codes/bridge.env"
-chmod 600 "$HOME/.codes/bridge.env"
-ok "bridge.env 已写入 ~/.codes/bridge.env"
-
-warn "请自行配置 Claude Code API 凭据 (ANTHROPIC_AUTH_TOKEN 等)，"
-warn "建议写入 ~/.profile 或 ~/.bashrc，或通过 claude login 登录。"
-
-# ─── Phase 6: Claude Enhance 安装 ─────────────────────────────────
-info "Phase 6/7: 安装 Claude Enhance..."
-
-ENHANCE_DIR="$CODES_DIR/claude_enhance"
-CLAUDE_DIR="$HOME/.claude"
-
-if [ ! -d "$ENHANCE_DIR" ]; then
-  warn "claude_enhance 目录不存在，跳过增强安装"
-else
-  # 6.1: 创建目录结构
-  mkdir -p "$CLAUDE_DIR/agents"
-  mkdir -p "$CLAUDE_DIR/commands"
-  mkdir -p "$CLAUDE_DIR/contexts"
-  mkdir -p "$CLAUDE_DIR/scripts/hooks"
-  mkdir -p "$CLAUDE_DIR/scripts/lib"
-  mkdir -p "$CLAUDE_DIR/skills"
-  mkdir -p "$CLAUDE_DIR/rules/common"
-  mkdir -p "$CLAUDE_DIR/rules/typescript"
-  mkdir -p "$CLAUDE_DIR/rules/python"
-  mkdir -p "$CLAUDE_DIR/rules/golang"
-  mkdir -p "$CLAUDE_DIR/rules/web"
-
-  # 6.2: 安装 agents
-  cp "$ENHANCE_DIR/agents/"*.md "$CLAUDE_DIR/agents/"
-  ok "agents 已安装 ($(ls "$ENHANCE_DIR/agents/"*.md | wc -l) 个)"
-
-  # 6.3: 安装 rules
-  cp "$ENHANCE_DIR/rules/common/"*.md "$CLAUDE_DIR/rules/common/"
-  cp "$ENHANCE_DIR/rules/typescript/"*.md "$CLAUDE_DIR/rules/typescript/"
-  cp "$ENHANCE_DIR/rules/python/"*.md "$CLAUDE_DIR/rules/python/"
-  cp "$ENHANCE_DIR/rules/golang/"*.md "$CLAUDE_DIR/rules/golang/"
-  [ -d "$ENHANCE_DIR/rules/web" ] && cp "$ENHANCE_DIR/rules/web/"*.md "$CLAUDE_DIR/rules/web/"
-  ok "rules 已安装 (common, typescript, python, golang, web)"
-
-  # 6.4: 安装 commands（处理与内置命令的冲突）
-  # Claude Code 内置命令: /plan (切换 Plan 模式)
-  BUILTIN_COMMANDS="plan"
-  CMD_COUNT=0
-  CMD_RENAMED=0
-  for cmd_file in "$ENHANCE_DIR/commands/"*.md; do
-    name=$(basename "$cmd_file" .md)
-    if echo "$BUILTIN_COMMANDS" | grep -qw "$name"; then
-      cp "$cmd_file" "$CLAUDE_DIR/commands/enhance-${name}.md"
-      CMD_RENAMED=$((CMD_RENAMED + 1))
-      info "  /${name} → /enhance-${name} (避免与内置命令冲突)"
-    else
-      cp "$cmd_file" "$CLAUDE_DIR/commands/${name}.md"
-    fi
-    CMD_COUNT=$((CMD_COUNT + 1))
-  done
-  ok "commands 已安装 (${CMD_COUNT} 个, ${CMD_RENAMED} 个重命名)"
-
-  # 6.5: 安装 skills（保留完整子目录结构）
-  cp -r "$ENHANCE_DIR/skills/"* "$CLAUDE_DIR/skills/"
-  SKILL_COUNT=$(find "$ENHANCE_DIR/skills" -maxdepth 1 -mindepth 1 -type d | wc -l)
-  ok "skills 已安装 (${SKILL_COUNT} 个)"
-
-  # 6.6: 安装 contexts
-  cp "$ENHANCE_DIR/contexts/"*.md "$CLAUDE_DIR/contexts/"
-  ok "contexts 已安装"
-
-  # 6.7: 安装 scripts（hooks 和 lib 脚本）
-  cp -r "$ENHANCE_DIR/scripts/hooks/"* "$CLAUDE_DIR/scripts/hooks/" 2>/dev/null || true
-  cp -r "$ENHANCE_DIR/scripts/lib/"* "$CLAUDE_DIR/scripts/lib/" 2>/dev/null || true
-  # 复制其他顶层脚本
-  for f in "$ENHANCE_DIR/scripts/"*.js "$ENHANCE_DIR/scripts/"*.sh; do
-    [ -f "$f" ] && cp "$f" "$CLAUDE_DIR/scripts/"
-  done
-  ok "scripts 已安装"
-
-  # 6.8: 合并 hooks 到 settings.json + MCP servers 到 .claude.json
-  # 使用 Node.js 处理 JSON 合并（避免 jq 转义问题）
-  ENHANCE_DIR="$ENHANCE_DIR" CLAUDE_DIR="$CLAUDE_DIR" node << 'MERGE_EOF'
-const fs = require('fs');
-const path = require('path');
-
-const enhanceDir = process.env.ENHANCE_DIR;
-const claudeDir = process.env.CLAUDE_DIR;
-const home = process.env.HOME;
-
-// ── 处理 hooks ──────────────────────────────────────────
-const hooksPath = path.join(enhanceDir, 'hooks', 'hooks.json');
-const hooksConfig = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
-
-// 去掉 "Block creation of random .md files" hook
-hooksConfig.hooks.PreToolUse = hooksConfig.hooks.PreToolUse.filter(
-  h => !h.description.includes('Block creation of random .md files')
-);
-
-// 替换 ${CLAUDE_PLUGIN_ROOT} 为实际安装路径
-let hooksJson = JSON.stringify(hooksConfig.hooks);
-hooksJson = hooksJson.split('${CLAUDE_PLUGIN_ROOT}').join(claudeDir);
-const processedHooks = JSON.parse(hooksJson);
-
-// 读取或创建 settings.json
-const settingsPath = path.join(claudeDir, 'settings.json');
-let settings = {};
-if (fs.existsSync(settingsPath)) {
-  settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-}
-
-// 合并 hooks
-settings.hooks = processedHooks;
-
-// 设置默认模型（若未配置）
-settings.model = settings.model || 'sonnet';
-settings.effortLevel = settings.effortLevel || 'high';
-
-// 移除 everything-claude-code 插件引用（已改为直接安装）
-if (settings.enabledPlugins) {
-  delete settings.enabledPlugins['everything-claude-code@everything-claude-code'];
-  if (Object.keys(settings.enabledPlugins).length === 0) {
-    delete settings.enabledPlugins;
-  }
-}
-
-fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
-console.error('[OK] hooks 已合并到 settings.json');
-
-// ── 合并 MCP servers ────────────────────────────────────
-const claudeJsonPath = path.join(home, '.claude.json');
-const mcpConfigPath = path.join(enhanceDir, 'mcp-configs', 'mcp-servers.json');
-
-if (fs.existsSync(claudeJsonPath) && fs.existsSync(mcpConfigPath)) {
-  const claudeJson = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
-  const mcpContent = fs.readFileSync(mcpConfigPath, 'utf8');
-
-  // mcp-servers.json 是 JSON 片段，需要包裹成完整 JSON
-  let newServers = {};
-  try {
-    const wrapped = JSON.parse('{' + mcpContent + '}');
-    newServers = wrapped.mcpServers || {};
-  } catch (e) {
-    console.error('[WARN] mcp-servers.json 解析失败: ' + e.message);
-  }
-
-  if (!claudeJson.mcpServers) {
-    claudeJson.mcpServers = {};
-  }
-
-  // 只添加不存在的 MCP 服务器（不覆盖已有配置和 token）
-  let added = 0;
-  for (const [name, config] of Object.entries(newServers)) {
-    if (!claudeJson.mcpServers[name]) {
-      claudeJson.mcpServers[name] = config;
-      added++;
-    }
-  }
-
-  if (added > 0) {
-    fs.writeFileSync(claudeJsonPath, JSON.stringify(claudeJson, null, 2) + '\n');
-    console.error('[OK] MCP 服务器: 新增 ' + added + ' 个');
-  } else {
-    console.error('[OK] MCP 服务器: 全部已存在，无需更新');
-  }
-} else if (!fs.existsSync(claudeJsonPath)) {
-  console.error('[WARN] ~/.claude.json 不存在，跳过 MCP 配置');
-}
-MERGE_EOF
-
-  ok "Claude Enhance 安装完成"
-fi
-
-# ─── Phase 7: 创建 systemd 服务 ──────��───────────────────────────
-info "Phase 7/7: 创建 systemd 服务..."
+# ─── Phase 6: 创建 systemd 服务 ──────────────────────────────────
+info "Phase 6/6: 创建 systemd 服务..."
 
 cd "$CODES_DIR/bridge"
 node setup-service.mjs
@@ -394,8 +214,8 @@ echo ""
 echo "  重要文件:"
 echo "    bridge 配置:   ~/.codes/bridge.json"
 echo "    飞书 secret:   ~/.codes/secrets/${PROJECT_ALIAS}_secret"
-echo "    Claude Code:   ~/.claude/"
-echo "    Claude Enhance: ~/codes/claude_enhance/"
+echo "    模型 API key:  ${CODES_DIR}/bridge/.env"
+echo "    Codex home:    ~/.codes/codex-home/ (bridge 生成的 config + 会话 + 记忆)"
 echo "    bridge 日志:   ~/.codes/logs/"
 echo ""
 echo "  自测:"

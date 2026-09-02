@@ -139,6 +139,29 @@ interface AgentSession {
 
 ---
 
+---
+
+## 七、决策与落地（2026-09-02 补记）
+
+### 决策：选 Codex，feat/dsh 分支整体切换
+
+用户决策：这是生产系统，不折腾。Claude Code 对第三方模型封闭且有负优化；成熟度最理想的替代就是 Codex。需求收敛为"把 Codex CLI（仅 CLI，不含 desktop/web）的 IO 完整桥接到飞书"，思路与当初 AtomCode 改造一致。
+
+落地范围（本分支）：
+
+- 后端单一化为 `CodexAppServer`（`codex app-server`，JSON-RPC over stdio），移除 ClaudeProcess / AtomCodeDaemon；
+- 每项目独立 Provider：`thread/start` 原生支持 `model` + `modelProvider` 参数，`bridge.json` 按项目配置（不复杂，直接做掉）；
+- 跨会话记忆：codex 内置两阶段 memory 管线（`[features] memories = true`，Stable），**替代 server-memory MCP**；
+- `claude_enhance/` 与 AtomCode DLC 脚本从本分支移除（codex 有自己的 skills/AGENTS.md 生态）。
+
+### 实测验证结论（2026-09-02，codex-cli 0.152.1）
+
+1. **模型接入**：本机网关（阿里云 MaaS token-plan）的 `/compatible-mode/v1/responses` 端点可用，`glm-5.2` 实跑通过。`/v1/responses`（anthropic 路径）不存在，Responses 端点挂在 `compatible-mode` 路径下——**接入前必须探测实际路径**。
+2. **沙箱**：本机 `kernel.apparmor_restrict_unprivileged_userns = 1`，bubblewrap 起不来（`bwrap: loopback: Failed RTM_NEWADDR`）→ 生产配置定为 `danger-full-access` + `approval never`（与旧 `--dangerously-skip-permissions` 姿态一致）。
+3. **协议全链路**：initialize → thread/start（带 model/modelProvider/sandbox 覆盖）→ turn/start → `item/agentMessage/delta` 增量 → `thread/tokenUsage/updated` → `turn/completed`，以及跨进程 `thread/resume`（`excludeTurns: true`）+ 上下文连续性，全部实测通过；后端类 19 项端到端断言全绿（含打断、并发守卫、工具执行、崩溃恢复语义）。
+4. **模型元数据**：`glm-5.2` 无内置元数据（警告级），用 `model_context_window` 显式声明上下文窗口规避。
+5. **版本纪律**：codex stable 2-4 天一版、app-server 协议 churn 快——`EXPECTED_CODEX_VERSION` 钉住基线版本，升级需重跑验证。
+
 ## 附：关键证据文件索引
 
 ### dsh（`/home/wukong/codes/deepseek-harness`，0.1.2-alpha.2）

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Feishu-Claude Bridge — 配置备份脚本
+# Feishu-Codex Bridge — 配置备份脚本
 #
 # 用法:
 #   ./backup.sh <ssh_target> [backup_root]
@@ -24,9 +24,7 @@ Usage:
 Description:
   从远端服务器下载以下内容到本地：
   - ~/.codes     (排除 logs/ 与 bridge-sessions.json)
-  - ~/.claude.json
-  - ~/.claude/settings.json
-  - ~/.claude/projects/*/memory
+    含 bridge.json、secrets、codex-home（config、会话 rollout、memories）
 
 Arguments:
   ssh_target   SSH 目标（如 incu 或 user@host）
@@ -77,21 +75,6 @@ declare -a targets=()
 
 if [[ -e "$home/.codes" ]]; then
   targets+=(".codes")
-fi
-
-if [[ -f "$home/.claude.json" ]]; then
-  targets+=(".claude.json")
-fi
-
-if [[ -f "$home/.claude/settings.json" ]]; then
-  targets+=(".claude/settings.json")
-fi
-
-if [[ -d "$home/.claude/projects" ]]; then
-  while IFS= read -r memory_dir; do
-    rel_path="${memory_dir#"$home/"}"
-    targets+=("$rel_path")
-  done < <(find "$home/.claude/projects" -mindepth 2 -maxdepth 2 -type d -name memory -print | sort)
 fi
 
 if [[ "${#targets[@]}" -eq 0 ]]; then

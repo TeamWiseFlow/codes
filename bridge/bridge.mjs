@@ -1,17 +1,24 @@
 /**
- * Feishu ↔ Claude Code Bridge
+ * Feishu ↔ Codex Bridge
  *
- * Directly manages Claude Code subprocesses for each project,
- * with Feishu bots as the interaction UI.
+ * Drives one Codex CLI `app-server` subprocess per project and bridges its
+ * full IO to Feishu bots (the interaction UI). Codex is OpenAI's open-source
+ * coding agent; the app-server subcommand exposes a JSON-RPC 2.0 stdio
+ * protocol (JSONL framing) that supports streaming deltas, interrupts,
+ * structured approvals and cross-process thread resume.
  *
  * Architecture:
  *   bridge.mjs (single Node.js process)
  *     ├── loadBridgeConfig() — reads ~/.codes/bridge.json
- *     ├── ClaudeProcess (one per project) — manages claude subprocess
- *     │     ├── spawn: claude --output-format stream-json --input-format stream-json
- *     │     ├── stdin: sends user messages (JSONL)
- *     │     ├── stdout: reads event stream, detects type:"result" for turn completion
- *     │     └── respawn: auto-restart with --resume <session-id> on next message
+ *     ├── ensureCodexHome() — generates ~/.codes/codex-home/config.toml
+ *     │     (providers, default model, built-in memories pipeline)
+ *     ├── CodexAppServer (one per project) — manages codex subprocess
+ *     │     ├── spawn: codex app-server (stdio JSON-RPC, JSONL)
+ *     │     ├── initialize → thread/start | thread/resume (session = thread id)
+ *     │     ├── turn/start sends user text; item/agentMessage/delta streams
+ *     │     │   the answer; turn/completed ends the turn
+ *     │     ├── turn/interrupt cancels an in-flight turn
+ *     │     └── respawn: next message re-initializes and resumes the thread
  *     └── FeishuBot (one per project) — manages Feishu WebSocket connection
  *           ├── createLarkChannel (one per bot app)
  *           ├── channel.on({ message, cardAction, ... })
@@ -19,6 +26,7 @@
  *
  * Config: ~/.codes/bridge.json
  * Sessions: ~/.codes/bridge-sessions.json (auto-saved)
+ * Codex home: ~/.codes/codex-home (generated config.toml, rollouts, memories)
  */
 
 import * as Lark from '@larksuiteoapi/node-sdk';
@@ -31,7 +39,7 @@ import * as https from 'node:https';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { spawn, execSync } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import util from 'node:util';
 
 // ─── Console timestamp + rotating-file logging ─────────────────
@@ -157,7 +165,9 @@ const MAX_ATTACHMENTS = Number(process.env.FEISHU_BRIDGE_MAX_ATTACHMENTS ?? 4);
 const SELFTEST = process.argv.includes('--selftest') || process.env.FEISHU_BRIDGE_SELFTEST === '1';
 let DEBUG = process.env.FEISHU_BRIDGE_DEBUG === '1';
 const BRIDGE_VERSION = readBridgeVersion();
-const EXPECTED_CLAUDE_VERSION = '2.1.116';
+// Protocol-tested codex CLI version. app-server protocol churns fast
+// (stable releases every 2-4 days); a mismatch is a warning, not fatal.
+const EXPECTED_CODEX_VERSION = '0.152.1';
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
@@ -554,125 +564,361 @@ function cleanupTempFile(filePath) {
   }
 }
 
-// ─── ClaudeProcess ────────────────���──────────────────────────────
+// ─── CodexAppServer ─────────────────────────────────────────────
+// Bridges one Codex CLI `app-server` subprocess (JSON-RPC 2.0 over stdio,
+// newline-delimited JSON) to a Feishu project. One process per project.
+//
+// Wire protocol (validated against codex-cli 0.152.1):
+//   → initialize + initialized          handshake, once per connection
+//   → thread/start | thread/resume      open / continue a thread; the
+//                                       thread id IS the persisted session
+//   → turn/start                        send user text, starts a turn
+//   ← item/agentMessage/delta           streamed answer text
+//   ← item/started + item/completed     item lifecycle (tools, messages)
+//   ← thread/tokenUsage/updated         token accounting (last + total)
+//   ← turn/completed                    terminal: completed|interrupted|failed
+//   ← item/*/requestApproval            server-initiated request — MUST reply
+//   → turn/interrupt                    cancel an in-flight turn
+//
+// Sandbox/approval stance: this host cannot run codex's bubblewrap sandbox
+// (user namespaces are restricted), so threads default to
+// sandbox=danger-full-access + approvalPolicy=never — the exact security
+// posture the previous Claude backend ran with (--dangerously-skip-permissions).
+// Server-initiated approval requests should therefore never occur; if one
+// ever does (config change), it is auto-answered so the turn cannot hang.
 
-class ClaudeProcess {
+const CODEX_HOME = resolvePath('~/.codes/codex-home');
+const CODEX_DEFAULT_SANDBOX = 'danger-full-access';
+const CODEX_DEFAULT_APPROVAL = 'never';
+const CODEX_INIT_TIMEOUT_MS = 60_000;
+const CODEX_RPC_TIMEOUT_MS = 30_000;
+const CODEX_INTERRUPT_WATCHDOG_MS = 8_000;
+
+class CodexAppServer {
   /**
-   * @param {{ workDir: string, claudePath?: string, sessionId?: string|null }} opts
+   * @param {{
+   *   workDir: string,
+   *   codexPath?: string,
+   *   threadId?: string | null,
+   *   model?: string | null,
+   *   provider?: string | null,
+   *   sandbox?: string,
+   *   approvalPolicy?: string,
+   * }} opts
    */
-  constructor({ workDir, claudePath = 'claude', sessionId = null, model = null }) {
+  constructor({
+    workDir,
+    codexPath = 'codex',
+    threadId = null,
+    model = null,
+    provider = null,
+    sandbox = CODEX_DEFAULT_SANDBOX,
+    approvalPolicy = CODEX_DEFAULT_APPROVAL,
+  }) {
     this._workDir = workDir;
-    this._claudePath = claudePath;
-    this._sessionId = sessionId;
-    this._model = model;          // null = use CLI default
+    this._codexPath = codexPath;
+    this._sessionId = threadId;   // codex thread id (rollout persisted by codex)
+    this._model = model;          // null = config.toml default
+    this._provider = provider;    // null = config.toml default
+    this._sandbox = sandbox;
+    this._approvalPolicy = approvalPolicy;
+
     this._process = null;
-    this._stdin = null;
-    this._costUsd = 0;
-    this._turnCount = 0;
-    this._status = 'idle'; // idle | busy | stopped
-    this._pendingResolve = null;
+    this._initialized = false;    // initialize handshake done for this process
+    this._threadReady = false;    // thread started/resumed in this process
+
+    this._nextRpcId = 1;
+    this._pending = new Map();    // rpcId → { resolve, reject, method, timer }
+    this._pendingResolve = null;  // sendMessage promise pair
     this._pendingReject = null;
-    this._stdoutBuf = '';
+
+    this._costUsd = 0;            // accumulated total tokens across turns
+    this._turnCount = 0;
+    this._lastUsage = null;       // latest ThreadTokenUsage (for /context)
+    this._lastTurnError = null;
+
+    this._status = 'idle';        // idle | busy | stopped
+    this._busySince = null;
+    this._lastActivity = null;
+    this._onStream = null;
+    this._streamedText = '';
+    this._hasAssistantText = false;
+    this._lastAgentText = null;   // text of the last completed agentMessage item
+    this._turnId = null;
     this._interrupted = false;
-    this._busySince = null;       // Date.now() when sendMessage starts
-    this._lastActivity = null;    // { type, tool, ts } from intermediate events
-    this._onStream = null;        // callback(accumulatedText) for streaming
-    this._streamedText = '';      // accumulated display text for streaming
-    this._hasAssistantText = false; // true once real answer text (not tool markers) streams
+    this._interruptWatchdog = null;
+    this._stdoutBuf = '';
+    this._stderrTail = '';        // last stderr bytes, for crash diagnostics
+    this._connLock = Promise.resolve(); // serializes connection-level ops
   }
 
-  _spawn() {
-    const args = [
-      '--output-format', 'stream-json',
-      '--input-format', 'stream-json',
-      '--dangerously-skip-permissions',
-      '--verbose',
-      '--disallowedTools', 'EnterPlanMode,ExitPlanMode',
-    ];
-    if (this._sessionId) {
-      args.push('--resume', this._sessionId);
-    }
-    if (this._model) {
-      args.push('--model', this._model);
+  /**
+   * Serialize connection-level operations (start / ensureThread / compact).
+   * Without this, a compact racing a message can spawn duplicate app-server
+   * processes or open two threads at once.
+   */
+  _withConnLock(fn) {
+    const prev = this._connLock;
+    let release;
+    this._connLock = new Promise((r) => { release = r; });
+    return prev.then(fn, fn).finally(() => release());
+  }
+
+  /**
+   * Ensure the app-server process is up and initialized. Idempotent;
+   * respawns after a crash (the next _ensureThread resumes the thread).
+   * Callers from parallel entry points must hold _withConnLock.
+   */
+  async start() {
+    if (this._status === 'stopped') throw new Error('CodexAppServer is stopped');
+    if (this._process && this._process.exitCode === null) {
+      if (this._initialized) return;
+      // Alive but never finished the handshake (initialize timed out). Kill
+      // it before respawning so we don't orphan a process holding CODEX_HOME.
+      const stale = this._process;
+      this._process = null;
+      try { stale.kill('SIGKILL'); } catch {}
     }
 
-    const proc = spawn(this._claudePath, args, {
+    this._cleanupProcessState();
+
+    const proc = spawn(this._codexPath, ['app-server'], {
       cwd: this._workDir,
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, CODEX_HOME },
     });
-
     this._process = proc;
-    this._stdin = proc.stdin;
-    this._stdoutBuf = '';
 
-    proc.stdout.on('data', (chunk) => this._onStdoutData(chunk));
+    // Decode stdout as UTF-8 across chunk boundaries (CJK answers would
+    // garble when a multi-byte char splits across two chunks).
+    proc.stdout.setEncoding('utf8');
+    proc.stdout.on('data', (chunk) => this._onStdoutData(proc, chunk));
     proc.stderr.on('data', (chunk) => {
-      if (DEBUG) console.log(`[claude:stderr] ${chunk.toString().trimEnd()}`);
+      if (proc !== this._process) return;
+      const text = chunk.toString();
+      // Keep a small tail for crash diagnostics; codex also emits its tracing
+      // log here (bwrap warnings etc.), so don't treat it as fatal by itself.
+      this._stderrTail = (this._stderrTail + text).slice(-4096);
+      if (DEBUG) console.log(`[codex:stderr] ${text.trimEnd()}`);
     });
-    proc.on('exit', (code, signal) => this._onProcessExit(code, signal));
+    proc.on('exit', (code, signal) => this._onProcessExit(proc, code, signal));
     proc.on('error', (err) => {
-      console.error(`[ERROR] claude process error: ${err.message}`);
-      this._onProcessExit(-1, null);
+      console.error(`[ERROR] codex process error: ${err.message}`);
+      this._onProcessExit(proc, -1, null);
     });
+    // Writes racing process death surface EPIPE asynchronously here; the
+    // exit handler already rejects everything, so just absorb the event —
+    // an unhandled 'error' on the stream would crash the whole bridge.
+    proc.stdin.on('error', () => {});
 
-    this._status = 'idle';
-    if (DEBUG) console.log(`[claude] spawned pid=${proc.pid} cwd=${this._workDir} session=${this._sessionId || '(new)'}`);
+    if (DEBUG) console.log(`[codex] spawned pid=${proc.pid} cwd=${this._workDir} home=${CODEX_HOME}`);
+
+    await this._initialize();
+  }
+
+  async _initialize() {
+    const res = await this._send('initialize', {
+      clientInfo: { name: 'feishu-codes-bridge', title: 'Feishu Codes Bridge', version: BRIDGE_VERSION },
+      capabilities: {},
+    }, CODEX_INIT_TIMEOUT_MS);
+    this._notify('initialized');
+    this._initialized = true;
+    if (DEBUG) console.log(`[codex] initialized (codexHome=${res?.codexHome || '?'})`);
   }
 
   /**
-   * Send a message to Claude and wait for the result.
-   * Automatically spawns/respawns the subprocess as needed.
+   * Make sure a thread is open in the current process: resume the persisted
+   * thread when we have an id, otherwise start a fresh one. Per-project
+   * model/provider/sandbox overrides are (re)applied here so bridge.json
+   * stays authoritative over the thread's persisted settings.
+   */
+  async _ensureThread() {
+    if (this._threadReady && this._sessionId) return;
+
+    const overrides = {
+      ...(this._model ? { model: this._model } : {}),
+      ...(this._provider ? { modelProvider: this._provider } : {}),
+      approvalPolicy: this._approvalPolicy,
+      sandbox: this._sandbox,
+    };
+
+    if (this._sessionId) {
+      try {
+        await this._send('thread/resume', {
+          threadId: this._sessionId,
+          excludeTurns: true,
+          ...overrides,
+        }, CODEX_RPC_TIMEOUT_MS);
+        this._threadReady = true;
+        if (DEBUG) console.log(`[codex] resumed thread ${this._sessionId}`);
+        return;
+      } catch (err) {
+        // Thread gone or unreadable (deleted, corrupted, held by another
+        // process) — fall back to a fresh thread rather than failing the message.
+        console.warn(`[codex] thread/resume failed (${err.message}); starting a fresh thread`);
+        this._sessionId = null;
+      }
+    }
+
+    const res = await this._send('thread/start', {
+      cwd: this._workDir,
+      ...overrides,
+    }, CODEX_RPC_TIMEOUT_MS);
+    this._sessionId = res.thread.id;
+    this._threadReady = true;
+    if (DEBUG) console.log(`[codex] started thread ${this._sessionId} cwd=${this._workDir}`);
+  }
+
+  /**
+   * Send a message to the Codex agent and wait for the turn to complete.
    * @param {string} text
-   * @returns {Promise<{text: string, sessionId: string|null, costUsd: number}>}
+   * @param {{ onStream?: ((accumulated: string) => void) | null }} [opts]
+   * @returns {Promise<{text: string, sessionId: string|null, costUsd: number, interrupted?: boolean}>}
    */
   async sendMessage(text, { onStream = null } = {}) {
-    if (this._status === 'stopped') {
-      throw new Error('ClaudeProcess is stopped');
-    }
-    if (this._status === 'busy') {
-      throw new Error('Claude is already processing a message');
-    }
+    if (this._status === 'stopped') throw new Error('CodexAppServer is stopped');
+    if (this._status === 'busy') throw new Error('Codex is already processing a message');
 
-    // Spawn or respawn if process exited
-    if (!this._process || this._process.exitCode !== null) {
-      this._spawn();
-    }
-
+    // Claim busy SYNCHRONOUSLY before any await: otherwise two concurrent
+    // messages can both pass the guard while start()/_ensureThread() is in
+    // flight and open two turns at once.
     this._status = 'busy';
     this._busySince = Date.now();
     this._lastActivity = { type: 'thinking', tool: null, ts: Date.now() };
     this._onStream = onStream;
     this._streamedText = '';
     this._hasAssistantText = false;
+    this._lastAgentText = null;
+    this._interrupted = false;
+    this._lastTurnError = null;
+
+    let turn;
+    try {
+      // Under the conn lock so a racing /compact cannot spawn a second
+      // process or open a thread concurrently.
+      turn = await this._withConnLock(async () => {
+        await this.start();           // spawn + initialize (respawn after crash)
+        await this._ensureThread();   // thread/start or thread/resume
+
+        const turnParams = {
+          threadId: this._sessionId,
+          input: [{ type: 'text', text }],
+        };
+        // The turn-level model override also re-pins the thread default, so
+        // a runtime /model switch takes effect immediately and stays sticky.
+        if (this._model) turnParams.model = this._model;
+
+        const res = await this._send('turn/start', turnParams, CODEX_RPC_TIMEOUT_MS);
+        return res.turn;
+      });
+    } catch (err) {
+      this._status = 'idle';
+      this._busySince = null;
+      this._lastActivity = null;
+      this._onStream = null;
+      this._streamedText = '';
+      this._turnId = null;   // never leave a stale turn id behind
+      throw err;
+    }
+    this._turnId = turn.id;
 
     return new Promise((resolve, reject) => {
       this._pendingResolve = resolve;
       this._pendingReject = reject;
+    });
+  }
 
-      const msg = JSON.stringify({
-        type: 'user',
-        message: { role: 'user', content: text },
-      }) + '\n';
+  /** Trigger conversation-history compaction for the project's thread. */
+  async compact() {
+    if (this._status === 'busy') return { ok: false, error: '正在处理消息，无法压缩' };
+    // Claim busy so a message cannot race the compaction setup, and run the
+    // connection work under the same lock as sendMessage.
+    this._status = 'busy';
+    this._busySince = Date.now();
+    this._lastActivity = { type: 'tool_use', tool: 'compact', ts: Date.now() };
+    try {
+      await this._withConnLock(async () => {
+        await this.start();
+        await this._ensureThread();
+        await this._send('thread/compact/start', { threadId: this._sessionId }, CODEX_RPC_TIMEOUT_MS);
+      });
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    } finally {
+      this._status = 'idle';
+      this._busySince = null;
+      this._lastActivity = null;
+    }
+  }
 
+  // ── JSON-RPC plumbing ─────────────────────────────────────────
+
+  /** Send a JSON-RPC request and wait for the matching response. */
+  _send(method, params, timeoutMs = CODEX_RPC_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+      if (!this._process || this._process.exitCode !== null) {
+        reject(new Error('codex app-server process is not running'));
+        return;
+      }
+      // Prefixed string ids: codex's server-initiated requests use its own
+      // integer counter; separate namespaces guarantee the two can never
+      // collide in _dispatch.
+      const id = `bridge-${this._nextRpcId++}`;
+      const timer = setTimeout(() => {
+        if (this._pending.delete(id)) {
+          reject(new Error(`codex RPC timeout (${timeoutMs}ms): ${method}`));
+        }
+      }, timeoutMs);
+      this._pending.set(id, { resolve, reject, method, timer });
       try {
-        this._stdin.write(msg);
+        this._process.stdin.write(JSON.stringify({ method, id, params }) + '\n');
       } catch (err) {
-        this._status = 'idle';
-        this._onStream = null;
-        this._streamedText = '';
-        this._pendingResolve = null;
-        this._pendingReject = null;
-        reject(new Error(`Failed to write to claude stdin: ${err.message}`));
+        clearTimeout(timer);
+        this._pending.delete(id);
+        reject(new Error(`failed to write to codex stdin: ${err.message}`));
       }
     });
   }
 
-  _onStdoutData(chunk) {
-    this._stdoutBuf += chunk.toString();
+  /** Send a JSON-RPC notification (no response expected). */
+  _notify(method, params = {}) {
+    if (!this._process || this._process.exitCode !== null) return;
+    try {
+      this._process.stdin.write(JSON.stringify({ method, params }) + '\n');
+    } catch {}
+  }
 
-    // Guard against unbounded buffer growth (e.g. huge tool_result)
+  /** Answer a server-initiated request (approvals, elicitations…). */
+  _replyToServerRequest(id, result) {
+    if (!this._process || this._process.exitCode !== null) return;
+    try {
+      this._process.stdin.write(JSON.stringify({ id, result }) + '\n');
+    } catch {}
+  }
+
+  _rejectAllPending(err) {
+    for (const [id, p] of this._pending) {
+      clearTimeout(p.timer);
+      this._pending.delete(id);
+      p.reject(err);
+    }
+  }
+
+  _clearSendMessagePending() {
+    this._pendingResolve = null;
+    this._pendingReject = null;
+  }
+
+  // ── stdout dispatch ───────────────────────────────────────────
+
+  _onStdoutData(proc, chunk) {
+    if (proc !== this._process) return; // superseded process — ignore its tail
+    this._stdoutBuf += chunk;
+
+    // Guard against unbounded buffer growth (e.g. a giant tool output item)
     if (this._stdoutBuf.length > 64 * 1024 * 1024) {
-      console.error('[ERROR] claude stdout buffer overflow (>64MB), killing process');
+      console.error('[ERROR] codex stdout buffer overflow (>64MB), killing process');
       this._stdoutBuf = '';
       if (this._process) try { this._process.kill('SIGKILL'); } catch {}
       return;
@@ -683,124 +929,306 @@ class ClaudeProcess {
 
     for (const line of lines) {
       if (!line.trim()) continue;
+      let msg;
       try {
-        const event = JSON.parse(line);
-
-        // Capture session_id from any event that carries it
-        if (event.session_id) {
-          this._sessionId = event.session_id;
-        }
-
-        // Track intermediate activity for progress updates
-        if (event.type === 'assistant') {
-          // Extract streaming text from content blocks.
-          // Claude CLI sends assistant events with message.content array;
-          // each event contains only its own blocks (not accumulated).
-          const content = Array.isArray(event.message?.content)
-            ? event.message.content
-            : Array.isArray(event.content)
-              ? event.content
-              : [];
-          for (const block of content) {
-            if (block.type === 'text' && block.text) {
-              this._streamedText += block.text;
-              this._hasAssistantText = true;
-            } else if (block.type === 'tool_use') {
-              this._streamedText += `\n\n> 🔧 _Using ${block.name || 'tool'}..._\n\n`;
-            }
-          }
-          if (this._onStream && this._streamedText) {
-            this._onStream(this._streamedText);
-          }
-
-          const toolUse = content.find(b => b.type === 'tool_use');
-          this._lastActivity = {
-            type: toolUse ? 'tool_use' : 'thinking',
-            tool: toolUse?.name || null,
-            ts: Date.now(),
-          };
-        }
-
-        if (event.type === 'result') {
-          const resultText = String(event.result || '');
-          if (event.cost_usd != null) this._costUsd += Number(event.cost_usd) || 0;
-          this._turnCount++;
-          this._status = 'idle';
-          this._busySince = null;
-          this._lastActivity = null;
-          this._onStream = null;
-          this._streamedText = '';
-
-          if (this._pendingResolve) {
-            const resolve = this._pendingResolve;
-            this._pendingResolve = null;
-            this._pendingReject = null;
-            resolve({
-              text: resultText,
-              sessionId: this._sessionId,
-              costUsd: Number(event.cost_usd) || 0,
-            });
-          }
-        }
+        msg = JSON.parse(line);
       } catch {
-        // Non-JSON line — ignore
+        if (DEBUG) console.log(`[codex] non-JSON stdout line: ${line.slice(0, 200)}`);
+        continue;
       }
+      this._dispatch(msg);
     }
   }
 
-  _onProcessExit(code, signal) {
-    const pid = this._process?.pid;
-    if (DEBUG) console.log(`[claude] exited code=${code} signal=${signal} pid=${pid}`);
+  _dispatch(msg) {
+    // 1) Response to one of our requests
+    if (msg.id != null && this._pending.has(msg.id)) {
+      const p = this._pending.get(msg.id);
+      this._pending.delete(msg.id);
+      clearTimeout(p.timer);
+      if (msg.error) {
+        p.reject(new Error(`codex ${p.method} failed: ${msg.error.message || JSON.stringify(msg.error)}`));
+      } else {
+        p.resolve(msg.result);
+      }
+      return;
+    }
 
-    this._process = null;
-    this._stdin = null;
+    // 2) Server-initiated request (approvals, user input, elicitations)
+    if (msg.method && msg.id != null) {
+      this._handleServerRequest(msg);
+      return;
+    }
+
+    // 3) Notification
+    if (msg.method) {
+      this._handleNotification(msg.method, msg.params || {});
+    }
+  }
+
+  /**
+   * Answer server-initiated requests. The bridge is non-interactive by
+   * design; every request gets an immediate answer so a turn can never hang
+   * waiting on us. With approvalPolicy=never + danger-full-access these
+   * should not normally occur.
+   */
+  _handleServerRequest(msg) {
+    const { id, method, params } = msg;
+    console.warn(`[codex] server request: ${method} (auto-responding)`);
+    switch (method) {
+      case 'item/commandExecution/requestApproval':
+      case 'item/fileChange/requestApproval':
+        // Auto-accept = parity with the previous --dangerously-skip-permissions.
+        this._replyToServerRequest(id, { decision: 'accept' });
+        return;
+      case 'item/permissions/requestApproval':
+        // Grant the requested subset back, session-scoped.
+        this._replyToServerRequest(id, { scope: 'session', permissions: params?.permissions || {} });
+        return;
+      case 'item/tool/requestUserInput':
+        // No interactive user available — answer nothing and let the agent adapt.
+        this._replyToServerRequest(id, { answers: {} });
+        return;
+      case 'mcpServer/elicitation/request':
+        this._replyToServerRequest(id, { action: 'decline', content: null });
+        return;
+      case 'attestation/generate':
+        this._replyToServerRequest(id, { token: null });
+        return;
+      default:
+        console.warn(`[codex] unknown server request ${method} — replying with error`);
+        try {
+          this._process.stdin.write(JSON.stringify({
+            id,
+            error: { code: -32601, message: `bridge does not handle ${method}` },
+          }) + '\n');
+        } catch {}
+    }
+  }
+
+  // ── notifications ─────────────────────────────────────────────
+
+  _handleNotification(method, params) {
+    switch (method) {
+      case 'item/agentMessage/delta': {
+        this._streamedText += params.delta || '';
+        this._hasAssistantText = true;
+        this._lastActivity = { type: 'text', tool: null, ts: Date.now() };
+        if (this._onStream && this._streamedText) this._onStream(this._streamedText);
+        break;
+      }
+
+      case 'item/started': {
+        const item = params.item || {};
+        if (item.type !== 'agentMessage') this._noteToolActivity(item);
+        break;
+      }
+
+      case 'item/completed': {
+        const item = params.item || {};
+        if (item.type === 'agentMessage' && typeof item.text === 'string' && item.text) {
+          // Authoritative text for this message item. The LAST agentMessage of
+          // the turn is the conclusion; earlier ones are process narration
+          // before tool calls (dropped on tool start, AtomCode _finalText parity).
+          this._lastAgentText = item.text;
+        }
+        break;
+      }
+
+      case 'turn/plan/updated':
+        this._lastActivity = { type: 'tool_use', tool: 'plan', ts: Date.now() };
+        break;
+
+      // Reasoning streams (open models emit raw text, OpenAI-style summaries).
+      // They carry no user-visible content here — just mark the turn active.
+      case 'item/reasoning/textDelta':
+      case 'item/reasoning/summaryTextDelta':
+      case 'item/reasoning/summaryPartAdded':
+        this._lastActivity = { type: 'thinking', tool: null, ts: Date.now() };
+        break;
+
+      case 'thread/tokenUsage/updated': {
+        const usage = params.tokenUsage;
+        if (usage) {
+          this._lastUsage = usage;
+          const last = Number(usage.last?.totalTokens || 0);
+          if (last > 0) this._costUsd += last;
+        }
+        break;
+      }
+
+      case 'turn/completed':
+        this._finishTurn(params.turn || {});
+        break;
+
+      case 'error':
+        // Mid-turn error notification; turn/completed(failed) carries the same
+        // payload and is authoritative. Keep the message for the reject text.
+        this._lastTurnError = params.error?.message || 'codex error';
+        console.error(`[codex] turn error: ${this._lastTurnError}`);
+        break;
+
+      case 'configWarning':
+        console.warn(`[codex] configWarning: ${params.summary || ''}`);
+        break;
+      case 'warning':
+        if (DEBUG) console.log(`[codex] warning: ${params.message || ''}`);
+        break;
+
+      // Benign lifecycle noise
+      case 'thread/started':
+      case 'thread/status/changed':
+      case 'turn/started':
+      case 'serverRequest/resolved':
+      case 'account/rateLimits/updated':
+      case 'remoteControl/status/changed':
+      case 'turn/diff/updated':
+        break;
+
+      default:
+        if (DEBUG) console.log(`[codex] unhandled notification: ${method}`);
+    }
+  }
+
+  _noteToolActivity(item) {
+    const TOOL_LABELS = {
+      commandExecution: 'shell',
+      fileChange: 'edit',
+      mcpToolCall: 'mcp',
+      webSearch: 'web_search',
+      collabToolCall: 'subagent',
+      imageGeneration: 'image_gen',
+      imageView: 'image',
+    };
+    const label = TOOL_LABELS[item.type];
+    if (!label) return;
+    // A tool starting means any prior agent text was process narration, not
+    // the conclusion — drop it so the final card shows only the post-tool tail.
+    this._lastAgentText = null;
+    this._lastActivity = { type: 'tool_use', tool: label, ts: Date.now() };
+  }
+
+  /** Resolve/reject the pending sendMessage promise at turn end. */
+  _finishTurn(turn) {
+    if (this._status !== 'busy') return; // stale notification (e.g. compaction)
+    // Not our turn (e.g. a /compact compaction turn finishing while a user
+    // message is in flight) — must not settle the message's promise.
+    if (turn.id && this._turnId && turn.id !== this._turnId) return;
+    this._turnId = null;
+    if (this._interruptWatchdog) {
+      clearTimeout(this._interruptWatchdog);
+      this._interruptWatchdog = null;
+    }
+    this._turnCount++;
+
+    const status = turn.status || 'completed';
+    const interrupted = this._interrupted || status === 'interrupted';
+
+    this._status = 'idle';
+    this._busySince = null;
+    this._lastActivity = null;
     this._onStream = null;
     this._streamedText = '';
+    this._hasAssistantText = false;
+    this._interrupted = false;
 
-    // Flush any remaining buffered output before rejecting
-    if (this._stdoutBuf.trim()) {
-      try {
-        const event = JSON.parse(this._stdoutBuf.trim());
-        if (event.session_id) this._sessionId = event.session_id;
-        if (event.type === 'result') {
-          const resultText = String(event.result || '');
-          if (event.cost_usd != null) this._costUsd += Number(event.cost_usd) || 0;
-          this._turnCount++;
-          if (this._pendingResolve) {
-            const resolve = this._pendingResolve;
-            this._pendingResolve = null;
-            this._pendingReject = null;
-            this._status = 'idle';
-            this._stdoutBuf = '';
-            resolve({ text: resultText, sessionId: this._sessionId, costUsd: Number(event.cost_usd) || 0 });
-            return;
-          }
-        }
-      } catch {
-        // not valid JSON — discard
-      }
-    }
-    this._stdoutBuf = '';
+    const finalText = this._lastAgentText || '';
+    this._lastAgentText = null;
 
-    // If we were waiting for a result, resolve (if interrupted) or reject
-    if (this._status === 'busy' && this._pendingReject) {
-      if (this._interrupted) {
-        const resolve = this._pendingResolve;
-        this._pendingResolve = null;
-        this._pendingReject = null;
-        this._status = 'idle';
-        this._interrupted = false;
-        resolve({ text: '', interrupted: true, sessionId: this._sessionId, costUsd: 0 });
-      } else {
+    if (status === 'failed' && !interrupted) {
+      const errMsg = turn.error?.message || this._lastTurnError || 'codex turn failed';
+      this._lastTurnError = null;
+      if (this._pendingReject) {
         const reject = this._pendingReject;
-        this._pendingResolve = null;
-        this._pendingReject = null;
-        this._status = 'idle';
-        reject(new Error(`Claude process exited unexpectedly (code=${code}, signal=${signal})`));
+        this._clearSendMessagePending();
+        reject(new Error(errMsg));
       }
-    } else if (this._status !== 'stopped') {
+      return;
+    }
+
+    this._lastTurnError = null;
+    if (this._pendingResolve) {
+      const resolve = this._pendingResolve;
+      this._clearSendMessagePending();
+      resolve({
+        text: interrupted ? '' : finalText,
+        sessionId: this._sessionId,
+        costUsd: 0, // tokens accumulate in _costUsd; see /cost
+        ...(interrupted ? { interrupted: true } : {}),
+      });
+    }
+  }
+
+  // ── lifecycle ─────────────────────────────────────────────────
+
+  _cleanupProcessState() {
+    this._initialized = false;
+    this._threadReady = false;
+    this._stdoutBuf = '';
+    this._stderrTail = '';
+    this._turnId = null;
+    this._rejectAllPending(new Error('codex app-server connection reset'));
+  }
+
+  _onProcessExit(proc, code, signal) {
+    // Identity check: a superseded process (replaced in start(), killed in
+    // stop()) may exit much later — its stale event must not clobber the
+    // state of the live connection.
+    if (proc !== this._process) return;
+    if (DEBUG) console.log(`[codex] exited code=${code} signal=${signal}`);
+    this._process = null;
+    this._initialized = false;
+    this._threadReady = false;
+    this._onStream = null;
+    this._streamedText = '';
+    this._stdoutBuf = '';
+    this._turnId = null;
+
+    this._rejectAllPending(
+      new Error(`codex app-server exited unexpectedly (code=${code}, signal=${signal})`),
+    );
+
+    if (this._status !== 'busy') {
+      if (this._status !== 'stopped') this._status = 'idle';
+      return;
+    }
+
+    if (this._interrupted && this._pendingResolve) {
+      const resolve = this._pendingResolve;
+      this._clearSendMessagePending();
+      this._status = 'idle';
+      this._interrupted = false;
+      resolve({ text: '', interrupted: true, sessionId: this._sessionId, costUsd: 0 });
+    } else if (this._pendingReject) {
+      const reject = this._pendingReject;
+      this._clearSendMessagePending();
+      this._status = 'idle';
+      const tail = this._stderrTail.trim().split('\n').slice(-3).join(' | ');
+      reject(new Error(
+        `codex app-server exited unexpectedly (code=${code}, signal=${signal})` +
+        (tail ? ` — ${tail}` : ''),
+      ));
+    } else {
       this._status = 'idle';
     }
+  }
+
+  /** Interrupt the in-flight turn. Returns true if a turn was in progress. */
+  interrupt() {
+    if (this._status !== 'busy' || !this._turnId) return false;
+    this._interrupted = true;
+    this._send('turn/interrupt', {
+      threadId: this._sessionId,
+      turnId: this._turnId,
+    }, 5000).catch(() => {});
+    // Watchdog: if turn/completed never arrives, unstick the turn ourselves.
+    this._interruptWatchdog = setTimeout(() => {
+      if (this._status === 'busy' && this._interrupted) {
+        console.warn('[codex] turn/completed missing after interrupt; forcing completion');
+        this._finishTurn({ status: 'interrupted' });
+      }
+    }, CODEX_INTERRUPT_WATCHDOG_MS);
+    return true;
   }
 
   /** Stop the process and mark as stopped (won't accept new messages). */
@@ -808,23 +1236,25 @@ class ClaudeProcess {
     this._status = 'stopped';
     this._onStream = null;
     this._streamedText = '';
-
-    if (!this._process) return;
-
-    const proc = this._process;
-    this._process = null;
-    this._stdin = null;
-
-    // Reject pending promise
-    if (this._pendingReject) {
-      const reject = this._pendingReject;
-      this._pendingResolve = null;
-      this._pendingReject = null;
-      reject(new Error('ClaudeProcess stopped'));
+    if (this._interruptWatchdog) {
+      clearTimeout(this._interruptWatchdog);
+      this._interruptWatchdog = null;
     }
 
-    try { proc.kill('SIGTERM'); } catch {}
+    if (this._pendingReject) {
+      const reject = this._pendingReject;
+      this._clearSendMessagePending();
+      reject(new Error('CodexAppServer stopped'));
+    }
+    this._rejectAllPending(new Error('CodexAppServer stopped'));
 
+    if (!this._process) return;
+    const proc = this._process;
+    this._process = null;
+    this._initialized = false;
+    this._threadReady = false;
+
+    try { proc.kill('SIGTERM'); } catch {}
     await new Promise((resolve) => {
       const timeout = setTimeout(() => {
         try { proc.kill('SIGKILL'); } catch {}
@@ -835,15 +1265,16 @@ class ClaudeProcess {
     });
   }
 
-  /** Re-enable after stop (allow new messages). */
+  /** Re-enable after stop (allow new messages). Thread id is kept. */
   restart() {
     this._status = 'idle';
-    this._stdoutBuf = '';
     this._pendingResolve = null;
     this._pendingReject = null;
     this._interrupted = false;
     this._onStream = null;
     this._streamedText = '';
+    this._initialized = false;
+    this._threadReady = false;
   }
 
   info() {
@@ -851,9 +1282,11 @@ class ClaudeProcess {
       status: this._status,
       pid: this._process?.pid || null,
       sessionId: this._sessionId || null,
-      costUsd: Math.round(this._costUsd * 10000) / 10000,
+      costUsd: this._costUsd, // total tokens (not USD — provider-dependent pricing)
       turnCount: this._turnCount,
       model: this._model || null,
+      provider: this._provider || null,
+      backend: 'codex',
     };
   }
 
@@ -865,527 +1298,81 @@ class ClaudeProcess {
       return `正在处理… ${elapsed} | 工具: ${act.tool}`;
     }
     return `正在思考… ${elapsed}`;
-  }
-
-  interrupt() {
-    if (this._status !== 'busy' || !this._process) return false;
-    this._interrupted = true;
-    try { this._process.kill('SIGINT'); } catch {}
-    return true;
   }
 }
 
-// ─── AtomCodeDaemon ─────────────────────────────────────────────
-// Optional backend (per-project opt-in via bridge.json `backend: "atomcode"`).
-// Drives an `atomcode-daemon` HTTP process through the /live SSE protocol.
-// Mirrors the ClaudeProcess surface (sendMessage / interrupt / stop / restart /
-// info / progressText) so ProjectManager can treat both uniformly.
-//
-// Model pinning: AtomCode supports any OpenAI-compatible provider, but the
-// Feishu bridge use-case is "free CodingPlan GLM-5.2 from AtomGit". We pin
-// the default provider name to `AtomGit-GLM-5.2` (the AtomGit free-tier
-// model id) at daemon startup via POST /live/provider. /model slash command
-// can still override at runtime (see setProvider).
-//
-// Lifecycle:
-//   start()      → spawn atomcode-daemon --port N, poll /health, pin provider
-//   sendMessage() → POST /live/message + listen on /live SSE for TextDelta
-//   interrupt()   → POST /live/cancel
-//   stop()        → kill daemon process (SIGTERM → SIGKILL after 5s)
+// ─── Codex home (managed config.toml) ───────────────────────────
+// The bridge owns $CODEX_HOME (~/.codes/codex-home): config.toml is generated
+// from bridge.json on startup, so providers, defaults and the memories
+// pipeline have a single source of truth. Rollouts (sessions) and memories
+// also land here, which puts them inside the existing ~/.codes backup target.
 
-// Default model id shipped by AtomGit CodingPlan (GLM-5.2 free tier).
-const ATOMCODE_DEFAULT_MODEL = 'AtomGit-GLM-5.2';
+/** Serialize a JS value as a TOML value (strings/numbers/booleans only). */
+function toTomlValue(value) {
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return JSON.stringify(String(value)); // TOML basic strings ≈ JSON strings here
+}
 
-class AtomCodeDaemon {
-  /**
-   * @param {{
-   *   workDir: string,
-   *   daemonBin?: string,
-   *   port?: number|null,
-   *   approvalMode?: 'build' | 'plan' | 'bypass',
-   *   sessionId?: string | null,
-   *   model?: string | null,
-   * }} opts
-   */
-  constructor({
-    workDir,
-    daemonBin = 'atomcode',
-    port = null,
-    approvalMode = 'bypass',
-    sessionId = null,
-    model = null,
-  }) {
-    this._workDir = workDir;
-    this._daemonBin = daemonBin;
-    this._port = port;            // null = auto-pick (13456 + scan)
-    this._approvalMode = approvalMode;
-    this._sessionId = sessionId;
-    this._model = model || ATOMCODE_DEFAULT_MODEL;  // pinned default
-    this._process = null;
-    this._costUsd = 0;
-    this._turnCount = 0;
-    this._status = 'idle';        // idle | busy | stopped
-    this._busySince = null;
-    this._lastActivity = null;
-    this._onStream = null;
-    this._streamedText = '';
-    this._hasAssistantText = false;
-    this._finalText = '';         // text accumulated since the last tool_start;
-                                  // the post-tool tail = clean final answer
-                                  // (mirrors Claude's event.result semantics)
-    this._sseController = null;   // AbortController for the /live SSE fetch
-    this._pendingResolve = null;
-    this._pendingReject = null;
-    this._interrupted = false;
-    this._providerPinned = false; // true after first successful /live/provider
+function buildCodexConfigToml(config) {
+  const d = config.codexDefaults;
+  const lines = [
+    '# Generated by feishu-codes-bridge — manual edits are overwritten on startup.',
+    '# Source of truth: ~/.codes/bridge.json (providers / codexDefaults).',
+    '# Per-project model/provider overrides are applied via thread/start params.',
+    '',
+  ];
+  if (d.model) lines.push(`model = ${toTomlValue(d.model)}`);
+  if (d.provider) lines.push(`model_provider = ${toTomlValue(d.provider)}`);
+  lines.push(`approval_policy = ${toTomlValue(d.approvalPolicy || CODEX_DEFAULT_APPROVAL)}`);
+  lines.push(`sandbox_mode = ${toTomlValue(d.sandbox || CODEX_DEFAULT_SANDBOX)}`);
+  if (d.contextWindow) lines.push(`model_context_window = ${toTomlValue(Number(d.contextWindow))}`);
+
+  // Cross-session persistent memory — replaces the old server-memory MCP.
+  // Phase 1 extracts structured memories from finished rollouts in the
+  // background; Phase 2 consolidates them globally under $CODEX_HOME/memories.
+  lines.push(
+    '',
+    '[features]',
+    'memories = true',
+    '',
+    '[memories]',
+    'use_memories = true',
+    'generate_memories = true',
+  );
+
+  for (const [key, p] of Object.entries(config.providers)) {
+    lines.push(
+      '',
+      `[model_providers.${key}]`,
+      `name = ${toTomlValue(p.name || key)}`,
+      `base_url = ${toTomlValue(p.baseUrl)}`,
+      `env_key = ${toTomlValue(p.envKey)}`,
+      `wire_api = ${toTomlValue(p.wireApi || 'responses')}`,
+    );
   }
+  return lines.join('\n') + '\n';
+}
 
-  /** Base URL for the daemon's HTTP API. */
-  _baseUrl() {
-    return `http://127.0.0.1:${this._port}`;
+/** Write the managed config.toml (only when changed) and validate env keys. */
+function ensureCodexHome(config) {
+  fs.mkdirSync(CODEX_HOME, { recursive: true });
+  const target = path.join(CODEX_HOME, 'config.toml');
+  const desired = buildCodexConfigToml(config);
+  let current = null;
+  try { current = fs.readFileSync(target, 'utf8'); } catch {}
+  if (current !== desired) {
+    const tmp = target + '.tmp';
+    fs.writeFileSync(tmp, desired);
+    fs.renameSync(tmp, target);
+    console.log(`[OK] Codex config written: ${target}`);
   }
-
-  /**
-   * Spawn the daemon process and wait for /health to respond.
-   * Idempotent: if already running, returns immediately.
-   * After health is green, pins the model provider via /live/provider.
-   */
-  async start() {
-    if (this._process && this._process.exitCode === null) {
-      // Already up — still (re)pin the provider if we haven't yet.
-      if (!this._providerPinned) await this._pinProvider();
-      return;
+  for (const [key, p] of Object.entries(config.providers)) {
+    if (!process.env[p.envKey]) {
+      console.warn(
+        `[WARN] provider "${key}" expects env var ${p.envKey}, but it is not set ` +
+        `(add it to bridge/.env)`,
+      );
     }
-
-    // Auto-pick a port starting from 13456 if none specified.
-    if (!this._port) {
-      this._port = await this._findFreePort(13456);
-    }
-
-    // `atomcode daemon` subcommand: binds 127.0.0.1, only accepts
-    // --port / --idle-timeout / --client (no --host, no --approval-mode).
-    // Approval mode is set at runtime via POST /live/mode after health is green.
-    const args = [
-      'daemon',
-      '--port', String(this._port),
-      '--idle-timeout', '0',      // bridge manages lifecycle; never auto-shut
-    ];
-
-    this._process = spawn(this._daemonBin, args, {
-      cwd: this._workDir,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    if (DEBUG) {
-      this._process.stdout.on('data', (c) => process.stderr.write(`[daemon:out] ${c}`));
-      this._process.stderr.on('data', (c) => process.stderr.write(`[daemon:err] ${c}`));
-    }
-    this._process.on('exit', (code, signal) => {
-      if (DEBUG) console.log(`[daemon] exited code=${code} signal=${signal}`);
-      this._process = null;
-      this._providerPinned = false;  // re-pin after respawn
-    });
-
-    // Poll /health until ready (max 15s).
-    const deadline = Date.now() + 15_000;
-    while (Date.now() < deadline) {
-      try {
-        const res = await fetch(`${this._baseUrl()}/health`, {
-          signal: AbortSignal.timeout(1000),
-        });
-        if (res.ok) {
-          if (DEBUG) console.log(`[daemon] ready on port ${this._port}`);
-          await this._pinProvider();
-          await this._setApprovalMode();
-          return;
-        }
-      } catch {}
-      await new Promise((r) => setTimeout(r, 300));
-    }
-    throw new Error(`atomcode-daemon did not become healthy on port ${this._port} within 15s`);
-  }
-
-  /**
-   * Pin the model provider via POST /live/provider.
-   * Silent best-effort — if the pin fails (e.g. provider name unknown to
-   * daemon), we leave it to the daemon's default and let /model surface it.
-   */
-  async _pinProvider() {
-    if (!this._model) {
-      this._providerPinned = true;
-      return;
-    }
-    try {
-      const res = await fetch(`${this._baseUrl()}/live/provider`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: this._model }),
-        signal: AbortSignal.timeout(3000),
-      });
-      if (res.ok) {
-        this._providerPinned = true;
-        if (DEBUG) console.log(`[daemon] provider pinned to ${this._model}`);
-      } else if (DEBUG) {
-        console.log(`[daemon] /live/provider ${res.status} ${res.statusText}`);
-      }
-    } catch (err) {
-      if (DEBUG) console.log(`[daemon] pin provider failed: ${err?.message || err}`);
-    }
-  }
-
-  /**
-   * Set the runtime approval mode via POST /live/mode.
-   * `atomcode daemon` subcommand doesn't accept --approval-mode, so we set it
-   * at runtime after the daemon is healthy. Values: 'build' | 'plan' | 'bypass'.
-   */
-  async _setApprovalMode() {
-    if (!this._approvalMode) return;
-    try {
-      const res = await fetch(`${this._baseUrl()}/live/mode`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: this._approvalMode }),
-        signal: AbortSignal.timeout(3000),
-      });
-      if (res.ok && DEBUG) {
-        console.log(`[daemon] approval mode set to ${this._approvalMode}`);
-      } else if (DEBUG) {
-        console.log(`[daemon] /live/mode ${res.status} ${res.statusText}`);
-      }
-    } catch (err) {
-      if (DEBUG) console.log(`[daemon] set approval mode failed: ${err?.message || err}`);
-    }
-  }
-
-  /**
-   * Switch the active model at runtime. Called from /model slash command.
-   * @param {string} providerName
-   * @returns {Promise<boolean>} true on success
-   */
-  async setProvider(providerName) {
-    if (!providerName || typeof providerName !== 'string') return false;
-    await this.start();
-    try {
-      const res = await fetch(`${this._baseUrl()}/live/provider`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: providerName }),
-        signal: AbortSignal.timeout(3000),
-      });
-      if (res.ok) {
-        this._model = providerName;
-        this._providerPinned = true;
-        return true;
-      }
-    } catch {}
-    return false;
-  }
-
-  /** Scan for a free TCP port starting at `from`. */
-  async _findFreePort(from) {
-    for (let p = from; p < from + 200; p++) {
-      const busy = await new Promise((resolve) => {
-        const s = require('net').createServer();
-        s.once('error', () => resolve(true));
-        s.once('listening', () => { s.close(); resolve(false); });
-        s.listen(p, '127.0.0.1');
-      });
-      if (!busy) return p;
-    }
-    throw new Error(`No free port found in range ${from}..${from + 199}`);
-  }
-
-  /**
-   * Send a message to the AtomCode agent and wait for the turn to complete.
-   * @param {string} text
-   * @param {{ onStream?: ((accumulated: string) => void) }} [opts]
-   * @returns {Promise<{text: string, sessionId: string|null, costUsd: number}>}
-   */
-  async sendMessage(text, { onStream = null } = {}) {
-    if (this._status === 'stopped') throw new Error('AtomCodeDaemon is stopped');
-    if (this._status === 'busy') throw new Error('AtomCode is already processing a message');
-
-    await this.start();   // ensure daemon is up (respawn after crash)
-
-    this._status = 'busy';
-    this._busySince = Date.now();
-    this._lastActivity = { type: 'thinking', tool: null, ts: Date.now() };
-    this._onStream = onStream;
-    this._streamedText = '';
-    this._hasAssistantText = false;
-    this._finalText = '';
-    this._interrupted = false;
-
-    return new Promise((resolve, reject) => {
-      this._pendingResolve = resolve;
-      this._pendingReject = reject;
-
-      const url = `${this._baseUrl()}/live?session_id=${encodeURIComponent(this._sessionId || '')}`;
-      this._sseController = new AbortController();
-
-      fetch(url, { signal: this._sseController.signal, headers: { Accept: 'text/event-stream' } })
-        .then((res) => {
-          if (!res.ok) throw new Error(`/live SSE failed: ${res.status} ${res.statusText}`);
-          return res.body.getReader();
-        })
-        .then((reader) => this._pumpSse(reader))
-        .catch((err) => {
-          if (this._interrupted) return;   // abort from interrupt() is expected
-          this._fail(err);
-        });
-
-      // Fire the message after the SSE stream is opening.
-      // The daemon creates/attaches the LiveSession lazily on first /live or /live/message.
-      const body = JSON.stringify({
-        message: text,
-        session_id: this._sessionId || undefined,
-      });
-      fetch(`${this._baseUrl()}/live/message`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body,
-        signal: AbortSignal.timeout(30_000),
-      }).catch((err) => this._fail(err));
-    });
-  }
-
-  /** Read SSE chunks, split on `\n\n`, parse `data:` JSON lines. */
-  async _pumpSse(reader) {
-    let buf = '';
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += new TextDecoder().decode(value);
-        let idx;
-        while ((idx = buf.indexOf('\n\n')) >= 0) {
-          const rawEvent = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-          const dataLine = rawEvent.split('\n').find((l) => l.startsWith('data:'));
-          if (!dataLine) continue;
-          const jsonStr = dataLine.slice(5).trimStart();
-          if (!jsonStr) continue;
-          try {
-            this._handleWireEvent(JSON.parse(jsonStr));
-          } catch (e) {
-            if (DEBUG) console.log(`[daemon:sse] parse error: ${e?.message || e}`);
-          }
-        }
-      }
-    } catch (err) {
-      if (!this._interrupted && err?.name !== 'AbortError') {
-        this._fail(err);
-      }
-      return;
-    }
-    // Stream ended cleanly (done=true) without a terminal `state running=false`
-    // event. If we're still busy, the daemon closed the SSE response mid-turn
-    // (e.g. turn finished without emitting the terminal event, or the connection
-    // was reset). Without this fallback sendMessage() would never resolve and
-    // _status would stick on 'busy' forever, rejecting all new messages. Treat
-    // stream-end as turn-end with whatever final text we accumulated.
-    if (this._status === 'busy') {
-      if (DEBUG) console.log('[daemon:sse] stream ended without terminal event; completing turn');
-      this._complete(this._finalText);
-    }
-  }
-
-  /** Dispatch one LiveWireEvent. */
-  _handleWireEvent(ev) {
-    switch (ev.type) {
-      case 'snapshot':
-        if (ev.session_id) this._sessionId = ev.session_id;
-        break;
-      case 'session_switched':
-        if (ev.session_id) this._sessionId = ev.session_id;
-        break;
-      case 'text':
-        this._streamedText += ev.content || '';
-        this._finalText += ev.content || '';
-        this._hasAssistantText = true;
-        if (this._onStream && this._streamedText) this._onStream(this._streamedText);
-        break;
-      case 'reasoning':
-        // Reasoning deltas are folded into the stream but marked.
-        this._streamedText += `\n\n> _${ev.content || ''}_\n\n`;
-        if (this._onStream && this._streamedText) this._onStream(this._streamedText);
-        break;
-      case 'tool_start':
-        this._lastActivity = { type: 'tool_use', tool: ev.name, ts: Date.now() };
-        this._streamedText += `\n\n> 🔧 _Using ${ev.name || 'tool'}..._\n\n`;
-        // A tool_start means any text so far was process narration ("我先并行
-        // 查看…"), not the final answer. Drop it from _finalText so the turn-end
-        // card shows only the post-tool tail = clean conclusion (Claude parity).
-        this._finalText = '';
-        if (this._onStream) this._onStream(this._streamedText);
-        break;
-      case 'tool_result':
-        // Cost tracking is not exposed in /live wire events; leave _costUsd as-is.
-        break;
-      case 'tokens': {
-        // AtomCode daemon emits `tokens` wire events with prompt/completion/total.
-        // We don't have USD pricing for GLM-5.2 (free tier anyway), but we
-        // accumulate token counts into _costUsd as a *rough* proxy: store
-        // total tokens in the costUsd field (so /cost still shows something
-        // meaningful) — see /cost formatting in handleSlashCommand.
-        const total = Number(ev.total || 0);
-        if (total > 0) this._costUsd += total;
-        break;
-      }
-      case 'permission_request':
-        // In bypass mode the daemon auto-approves and never sends this.
-        // In build/plan mode we auto-approve here (bridge is non-interactive);
-        // users wanting interactive approval should keep approvalMode='bypass'
-        // or handle it via a future Feishu approval card.
-        this._respondPermission(ev.call_id, true).catch(() => {});
-        break;
-      case 'state':
-        // running=false marks turn end in many flows, but we also rely on
-        // the explicit terminal events below. Resolve with _finalText (the
-        // post-tool tail) so the card lands the clean conclusion, not the
-        // full process narration + tool markers.
-        if (ev.running === false && this._status === 'busy') {
-          this._complete(this._finalText);
-        }
-        break;
-      case 'command_output':
-        // Slash-command text output — surface as a streamed text chunk.
-        if (ev.text) {
-          this._streamedText += ev.text;
-          if (this._onStream) this._onStream(this._streamedText);
-        }
-        break;
-      case 'error':
-        this._fail(new Error(ev.message || 'daemon error'));
-        break;
-      case 'warning':
-        if (DEBUG) console.log(`[daemon:warn] ${ev.message}`);
-        break;
-      default:
-        if (DEBUG) console.log(`[daemon:sse] unhandled type=${ev.type}`);
-    }
-  }
-
-  /** POST /live/permission to approve/deny a pending tool call. */
-  async _respondPermission(callId, approved) {
-    await fetch(`${this._baseUrl()}/live/permission`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ call_id: callId, approved }),
-      signal: AbortSignal.timeout(5000),
-    });
-  }
-
-  /** Resolve the pending sendMessage promise with a result. */
-  _complete(text) {
-    if (this._status !== 'busy') return;
-    this._status = 'idle';
-    this._busySince = null;
-    this._lastActivity = null;
-    this._onStream = null;
-    this._streamedText = '';
-    this._sseController?.abort();
-    this._sseController = null;
-    if (this._pendingResolve) {
-      const resolve = this._pendingResolve;
-      this._pendingResolve = null;
-      this._pendingReject = null;
-      this._turnCount++;
-      resolve({ text, sessionId: this._sessionId, costUsd: 0 });
-    }
-  }
-
-  /** Reject the pending sendMessage promise. */
-  _fail(err) {
-    if (this._status !== 'busy') return;
-    this._status = 'idle';
-    this._busySince = null;
-    this._lastActivity = null;
-    this._onStream = null;
-    this._streamedText = '';
-    this._sseController?.abort();
-    this._sseController = null;
-    if (this._pendingReject) {
-      const reject = this._pendingReject;
-      this._pendingResolve = null;
-      this._pendingReject = null;
-      reject(err instanceof Error ? err : new Error(String(err)));
-    }
-  }
-
-  /** Interrupt the current turn. Returns true if a turn was in progress. */
-  async interrupt() {
-    if (this._status !== 'busy') return false;
-    this._interrupted = true;
-    try {
-      await fetch(`${this._baseUrl()}/live/cancel`, {
-        method: 'POST',
-        signal: AbortSignal.timeout(3000),
-      });
-    } catch {}
-    this._complete('');
-    return true;
-  }
-
-  async stop() {
-    this._status = 'stopped';
-    this._onStream = null;
-    this._streamedText = '';
-    this._sseController?.abort();
-    this._sseController = null;
-
-    if (this._pendingReject) {
-      const reject = this._pendingReject;
-      this._pendingResolve = null;
-      this._pendingReject = null;
-      reject(new Error('AtomCodeDaemon stopped'));
-    }
-
-    if (!this._process) return;
-    const proc = this._process;
-    this._process = null;
-    try { proc.kill('SIGTERM'); } catch {}
-    await new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        try { proc.kill('SIGKILL'); } catch {}
-        resolve();
-      }, 5000);
-      proc.on('exit', () => { clearTimeout(timeout); resolve(); });
-    });
-  }
-
-  /** Re-enable after stop (allow new messages). */
-  restart() {
-    this._status = 'idle';
-    this._pendingResolve = null;
-    this._pendingReject = null;
-    this._interrupted = false;
-    this._onStream = null;
-    this._streamedText = '';
-    this._process = null;   // start() will respawn
-    this._providerPinned = false;
-  }
-
-  info() {
-    return {
-      status: this._status,
-      pid: this._process?.pid || null,
-      sessionId: this._sessionId || null,
-      costUsd: Math.round(this._costUsd * 10000) / 10000,
-      turnCount: this._turnCount,
-      model: this._model || null,
-      backend: 'atomcode',
-    };
-  }
-
-  progressText() {
-    if (this._status !== 'busy' || !this._busySince) return null;
-    const elapsed = formatElapsed(Date.now() - this._busySince);
-    const act = this._lastActivity;
-    if (act?.type === 'tool_use' && act.tool) {
-      return `正在处理… ${elapsed} | 工具: ${act.tool}`;
-    }
-    return `正在思考… ${elapsed}`;
   }
 }
 
@@ -1438,26 +1425,58 @@ function loadBridgeConfig() {
     }
     proj.feishu.appSecretPath = resolvePath(proj.feishu.appSecretPath);
 
-    // Backend selection: "claude" (default, spawns claude CLI) or "atomcode"
-    // (spawns atomcode-daemon HTTP process, drives /live API).
-    // This is a per-project opt-in — mixed backends within one bridge process
-    // are supported (each project gets its own subprocess).
-    proj.backend = proj.backend || 'claude';
-    if (proj.backend !== 'claude' && proj.backend !== 'atomcode') {
-      console.error(
-        `[FATAL] Project "${alias}" backend must be "claude" or "atomcode" (got "${proj.backend}")`,
-      );
+    // Per-project Codex overrides (all optional — defaults come from the
+    // top-level `codexDefaults` / generated config.toml). `provider` must
+    // reference a key in the top-level `providers` map (or a provider already
+    // defined in a hand-maintained config.toml).
+    const cx = proj.codex || {};
+    proj.codex = {
+      model: cx.model || null,
+      provider: cx.provider || null,
+      sandbox: cx.sandbox || null,
+      approvalPolicy: cx.approvalPolicy || null,
+    };
+  }
+
+  // Model providers: defined once here, rendered into the managed
+  // ~/.codes/codex-home/config.toml ([model_providers.<key>]) on startup.
+  const providers = raw.providers || {};
+  // The key is interpolated as a TOML table name — restrict to bare keys so a
+  // dot/space can't silently produce a nested table or invalid TOML.
+  const TOML_BARE_KEY = /^[A-Za-z0-9_-]+$/;
+  for (const [key, p] of Object.entries(providers)) {
+    if (!TOML_BARE_KEY.test(key)) {
+      console.error(`[FATAL] providers key "${key}" must match ${TOML_BARE_KEY} (letters/digits/_/-)`);
       process.exit(1);
     }
-    if (proj.backend === 'atomcode') {
-      const ac = proj.atomcode || {};
-      proj.atomcode = {
-        daemonBin: ac.daemonBin || 'atomcode-daemon',
-        port: ac.port != null ? Number(ac.port) : null,
-        approvalMode: ac.approvalMode || 'bypass',
-        model: ac.model || null,   // null = ATOMCODE_DEFAULT_MODEL pin
-      };
+    if (!p.baseUrl || !p.envKey) {
+      console.error(`[FATAL] providers.${key} needs "baseUrl" and "envKey" in bridge.json`);
+      process.exit(1);
     }
+    if (p.wireApi && p.wireApi !== 'responses') {
+      console.error(`[FATAL] providers.${key}.wireApi must be "responses" (codex dropped "chat")`);
+      process.exit(1);
+    }
+  }
+  // Validate per-project provider references against the providers map.
+  for (const [alias, proj] of Object.entries(projects)) {
+    const prov = proj.codex.provider;
+    if (prov && !providers[prov]) {
+      console.error(`[FATAL] Project "${alias}" codex.provider "${prov}" not defined in providers`);
+      process.exit(1);
+    }
+  }
+
+  const codexDefaults = {
+    model: raw.codexDefaults?.model || null,
+    provider: raw.codexDefaults?.provider || null,
+    sandbox: raw.codexDefaults?.sandbox || CODEX_DEFAULT_SANDBOX,
+    approvalPolicy: raw.codexDefaults?.approvalPolicy || CODEX_DEFAULT_APPROVAL,
+    contextWindow: raw.codexDefaults?.contextWindow ? Number(raw.codexDefaults.contextWindow) : null,
+  };
+  if (codexDefaults.provider && !providers[codexDefaults.provider]) {
+    console.error(`[FATAL] codexDefaults.provider "${codexDefaults.provider}" not defined in providers`);
+    process.exit(1);
   }
 
   // Backup config (optional — set to false to disable)
@@ -1489,7 +1508,9 @@ function loadBridgeConfig() {
     thinkingThresholdMs: Number(
       raw.thinkingThresholdMs ?? process.env.FEISHU_THINKING_THRESHOLD_MS ?? 2500,
     ),
-    claudePath: raw.claudePath || 'claude',
+    codexPath: raw.codexPath || 'codex',
+    providers,
+    codexDefaults,
     debug: raw.debug === true || DEBUG,
     backup,
   };
@@ -1503,7 +1524,7 @@ const SCHEDULED_PATH = resolvePath('~/.codes/bridge-scheduled.json');
 class ProjectManager {
   constructor(config) {
     this._config = config;
-    /** @type {Map<string, {claude: ClaudeProcess, started: boolean, path: string, feishuAppId: string}>} */
+    /** @type {Map<string, {agent: CodexAppServer, started: boolean, path: string, feishuAppId: string}>} */
     this._projects = new Map();
   }
 
@@ -1512,53 +1533,29 @@ class ProjectManager {
 
     for (const [alias, proj] of Object.entries(this._config.projects)) {
       const sessionId = saved[alias]?.sessionId || null;
-      let claude;
-      if (proj.backend === 'atomcode') {
-        const ac = proj.atomcode || {};
-        claude = new AtomCodeDaemon({
-          workDir: proj.path,
-          daemonBin: ac.daemonBin,
-          port: ac.port,
-          approvalMode: ac.approvalMode,
-          model: ac.model,
-          sessionId,
-        });
-      } else {
-        claude = new ClaudeProcess({
-          workDir: proj.path,
-          claudePath: this._config.claudePath,
-          sessionId,
-        });
-      }
+      const cx = proj.codex || {};
+      const defaults = this._config.codexDefaults;
+      const agent = new CodexAppServer({
+        workDir: proj.path,
+        codexPath: this._config.codexPath,
+        threadId: sessionId,
+        model: cx.model || defaults.model,
+        provider: cx.provider || defaults.provider,
+        sandbox: cx.sandbox || defaults.sandbox,
+        approvalPolicy: cx.approvalPolicy || defaults.approvalPolicy,
+      });
 
       // Restore accumulated stats
-      if (saved[alias]?.costUsd) claude._costUsd = Number(saved[alias].costUsd) || 0;
-      if (saved[alias]?.turnCount) claude._turnCount = Number(saved[alias].turnCount) || 0;
+      if (saved[alias]?.costUsd) agent._costUsd = Number(saved[alias].costUsd) || 0;
+      if (saved[alias]?.turnCount) agent._turnCount = Number(saved[alias].turnCount) || 0;
 
       this._projects.set(alias, {
-        claude,
+        agent,
         started: true,
         path: proj.path,
         feishuAppId: proj.feishu.appId,
-        backend: proj.backend,
+        backend: 'codex',
       });
-
-      // AtomCodeDaemon spawns its daemon process eagerly so the first
-      // Feishu message has zero startup latency. ClaudeProcess spawns
-      // lazily on first sendMessage (no start() method).
-      if (typeof claude.start === 'function') {
-        try {
-          await claude.start();
-          console.log(
-            `[OK] AtomCode daemon started for "${alias}" on port ${claude._port}` +
-              (claude._model ? ` (model=${claude._model})` : ''),
-          );
-        } catch (err) {
-          console.error(
-            `[ERROR] Failed to start AtomCode daemon for "${alias}": ${err?.message || err}`,
-          );
-        }
-      }
     }
 
     // Auto-save sessions every 60s
@@ -1588,7 +1585,7 @@ class ProjectManager {
     const proj = this._projects.get(alias);
     if (!proj) return { ok: false, error: `未知项目: ${alias}` };
     if (proj.started) return { ok: true, message: `${alias} 已在运行中` };
-    proj.claude.restart();
+    proj.agent.restart();
     proj.started = true;
     return { ok: true, message: `${alias} 已启动` };
   }
@@ -1597,7 +1594,7 @@ class ProjectManager {
     const proj = this._projects.get(alias);
     if (!proj) return { ok: false, error: `未知项目: ${alias}` };
     if (!proj.started) return { ok: true, message: `${alias} 已处于停止状态` };
-    await proj.claude.stop();
+    await proj.agent.stop();
     proj.started = false;
     this._saveSessions();
     return { ok: true, message: `${alias} 已停止` };
@@ -1606,11 +1603,12 @@ class ProjectManager {
   async resetProject(alias) {
     const proj = this._projects.get(alias);
     if (!proj) return { ok: false, error: `未知项目: ${alias}` };
-    await proj.claude.stop();
-    proj.claude._sessionId = null;
-    proj.claude._costUsd = 0;
-    proj.claude._turnCount = 0;
-    proj.claude.restart();
+    await proj.agent.stop();
+    proj.agent._sessionId = null;
+    proj.agent._threadReady = false;
+    proj.agent._costUsd = 0;
+    proj.agent._turnCount = 0;
+    proj.agent.restart();
     proj.started = true;
     this._saveSessions();
     return { ok: true, message: `${alias} 会话已重置，下次对话将开始新会话` };
@@ -1635,7 +1633,7 @@ class ProjectManager {
   status() {
     const out = {};
     for (const [alias, proj] of this._projects) {
-      const info = proj.claude.info();
+      const info = proj.agent.info();
       out[alias] = { started: proj.started, path: proj.path, ...info };
     }
     return out;
@@ -1689,21 +1687,11 @@ class ProjectManager {
       .slice(0, 15);
     const outFile = path.join(dest, `backup_${timestamp}.tar.gz`);
 
-    // Collect targets (mirrors backup.sh logic, but local — no SSH needed)
+    // Collect targets. Everything the bridge owns lives under ~/.codes:
+    // bridge.json, sessions, scheduled messages, and the managed Codex home
+    // (config.toml, rollouts, memories). Logs are excluded below.
     const targets = [];
     if (fs.existsSync(path.join(home, '.codes'))) targets.push('.codes');
-    if (fs.existsSync(path.join(home, '.claude.json'))) targets.push('.claude.json');
-    if (fs.existsSync(path.join(home, '.claude', 'settings.json'))) targets.push('.claude/settings.json');
-
-    const projectsDir = path.join(home, '.claude', 'projects');
-    if (fs.existsSync(projectsDir)) {
-      for (const proj of fs.readdirSync(projectsDir).sort()) {
-        const memDir = path.join(projectsDir, proj, 'memory');
-        if (fs.existsSync(memDir)) {
-          targets.push(path.posix.join('.claude', 'projects', proj, 'memory'));
-        }
-      }
-    }
 
     if (targets.length === 0) {
       console.warn('[BACKUP] 无可备份内容，已跳过');
@@ -1751,7 +1739,7 @@ class ProjectManager {
   _saveSessions() {
     const data = {};
     for (const [alias, proj] of this._projects) {
-      const info = proj.claude.info();
+      const info = proj.agent.info();
       data[alias] = {
         sessionId: info.sessionId,
         costUsd: info.costUsd,
@@ -2425,22 +2413,25 @@ async function handleSlashCommand(pm, alias, text) {
       text: [
         'Bridge 命令:',
         '',
-        '/start [alias|all]  — 启动项目的 Claude Code',
-        '/stop [alias|all]   — 停止项目的 Claude Code',
+        '/start [alias|all]  — 启动项目的 Codex 会话',
+        '/stop [alias|all]   — 停止项目的 Codex 会话',
         '/reset [alias]      — 重置会话（清除历史，开始新对话）',
         '/clear [alias]      — 同 /reset',
         '/interrupt [alias]  — 打断当前正在处理的消息',
         '/status             — 查看所有项目状态',
         '/backup             — 立即触发一次备份',
-        '/model [名称] [alias] — 查看或切换模型（opus/sonnet/haiku 或完整模型名）',
+        '/model [名称] [alias] — 查看或切换模型（如 glm-5.2 / qwen3.8-max）',
+        '/cost [alias]       — 查看 token 用量',
+        '/context [alias]    — 查看上下文窗口占用',
+        '/compact [alias]    — 压缩会话历史',
         '/xx-dd 消息         — xx小时dd分钟后自动发送（一次）',
         '/scheduled [alias]  — 查看待发送定时任务',
         '/unschedule <id> [alias] — 撤回一个定时任务（支持 ID 前缀）',
         '/unschedule all [alias]  — 撤回该项目所有定时任务',
         '/help               — 显示此帮助',
         '',
-        '其他 / 开头的消息会直接转发给 Claude Code。',
-        'Claude 忙碌时发送的消息会自动排队（保留最新一条）。',
+        '其他 / 开头的消息会作为普通消息转发给 Codex。',
+        'Codex 忙碌时发送的消息会自动排队（保留最新一条）。',
         '',
         `当前项目: ${alias}`,
         `所有项目: ${pm.aliases().join(', ')}`,
@@ -2467,13 +2458,14 @@ async function handleSlashCommand(pm, alias, text) {
     for (const [a, info] of Object.entries(st)) {
       const flag = info.started ? '🟢' : '🔴';
       const pid = info.pid ? `PID=${info.pid}` : '';
-      const cost = info.costUsd > 0 ? `$${info.costUsd}` : '';
+      const tokens = info.costUsd > 0 ? `${info.costUsd.toLocaleString()} tok` : '';
       const turns = info.turnCount > 0 ? `${info.turnCount}轮` : '';
-      const session = info.sessionId ? `session=${info.sessionId.slice(0, 8)}…` : '';
+      const session = info.sessionId ? `thread=${info.sessionId.slice(0, 8)}…` : '';
+      const model = info.model ? `model=${info.model}` : '';
       const queued = pendingMessages.has(a) ? '📨 有排队消息' : '';
       const scheduledCount = getScheduledJobCount(a);
       const scheduled = scheduledCount > 0 ? `⏰ ${scheduledCount}个定时` : '';
-      const details = [pid, cost, turns, session, queued, scheduled].filter(Boolean).join(' ');
+      const details = [pid, model, tokens, turns, session, queued, scheduled].filter(Boolean).join(' ');
       lines.push(`${flag} ${a} (${info.path})${details ? ' — ' + details : ''}`);
     }
     return { text: lines.join('\n') };
@@ -2561,7 +2553,7 @@ async function handleSlashCommand(pm, alias, text) {
     const target = arg || alias;
     const proj = pm.getProject(target);
     if (!proj?.started) return { text: `项目 ${target} 未启动` };
-    const ok = proj.claude.interrupt();
+    const ok = proj.agent.interrupt();
     return { text: ok ? `已发送打断信号给 ${target}` : `${target} 当前没有在处理消息` };
   }
 
@@ -2571,32 +2563,81 @@ async function handleSlashCommand(pm, alias, text) {
     if (!proj) return { text: `错误: 未知项目 ${target}` };
 
     if (!arg) {
-      const current = proj.claude.info().model || '(CLI 默认)';
-      return { text: `项目 ${target} 当前模型: ${current}\n用法: /model <模型名> [alias]\n示例: /model opus\n      /model claude-opus-4-5-20251001` };
+      const info = proj.agent.info();
+      const current = info.model || '(config.toml 默认)';
+      const prov = info.provider || '(默认)';
+      return {
+        text: `项目 ${target} 当前模型: ${current} (provider: ${prov})\n` +
+          '用法: /model <模型名> [alias]\n' +
+          '示例: /model glm-5.2\n      /model qwen3.8-max',
+      };
     }
 
-    if (proj.claude.info().status === 'busy') {
+    if (proj.agent.info().status === 'busy') {
       return { text: `项目 ${target} 正在处理消息，请先等待完成或 /interrupt 打断后再切换模型。` };
     }
 
-    // Normalise shorthand names — [1m] suffix enables 1M context window
-    const modelAliases = {
-      opus: 'opus[1m]',
-      sonnet: 'sonnet[1m]',
-      haiku: 'haiku',
-    };
-    const resolved = modelAliases[arg.toLowerCase()] || arg;
-
-    proj.claude._model = resolved;
-    // Kill current process so it respawns with new --model on next message
-    if (proj.claude._process) {
-      try { proj.claude._process.kill('SIGTERM'); } catch {}
-    }
-
-    return { text: `✅ 项目 ${target} 已切换模型: ${resolved}\n下次消息起生效。` };
+    // The new model is applied via the turn-level override on the next
+    // turn/start (which also re-pins the thread default) — no process
+    // restart needed. Provider switches stay in bridge.json (restart).
+    proj.agent._model = arg;
+    return { text: `✅ 项目 ${target} 已切换模型: ${arg}\n下次消息起生效。` };
   }
 
-  // Unknown slash command — pass through to Claude Code as normal message
+  if (cmd === '/cost') {
+    const target = arg || alias;
+    const proj = pm.getProject(target);
+    if (!proj) return { text: `错误: 未知项目 ${target}` };
+    const info = proj.agent.info();
+    const usage = proj.agent._lastUsage;
+    const lines = [
+      `项目 ${target} token 用量:`,
+      `累计: ${info.costUsd.toLocaleString()} tokens / ${info.turnCount} 轮`,
+    ];
+    if (usage?.last) {
+      lines.push(
+        `上一轮: 输入 ${Number(usage.last.inputTokens || 0).toLocaleString()}` +
+        `（缓存命中 ${Number(usage.last.cachedInputTokens || 0).toLocaleString()}）` +
+        ` / 输出 ${Number(usage.last.outputTokens || 0).toLocaleString()}`,
+      );
+    }
+    lines.push('（不同 provider 计价不同，此处只统计 token 数）');
+    return { text: lines.join('\n') };
+  }
+
+  if (cmd === '/context') {
+    const target = arg || alias;
+    const proj = pm.getProject(target);
+    if (!proj) return { text: `错误: 未知项目 ${target}` };
+    const usage = proj.agent._lastUsage;
+    if (!usage?.total) {
+      return { text: `项目 ${target} 还没有用量数据，先发一条消息。` };
+    }
+    const used = Number(usage.total.totalTokens || 0);
+    const win = Number(usage.modelContextWindow || 0);
+    const pct = win > 0 ? ` (${((used / win) * 100).toFixed(1)}%)` : '';
+    const lines = [
+      `项目 ${target} 上下文占用:`,
+      win > 0
+        ? `${used.toLocaleString()} / ${win.toLocaleString()} tokens${pct}`
+        : `${used.toLocaleString()} tokens（上下文窗口大小未知）`,
+    ];
+    if (win > 0 && used / win > 0.75) {
+      lines.push('占用偏高，可用 /compact 压缩会话历史。');
+    }
+    return { text: lines.join('\n') };
+  }
+
+  if (cmd === '/compact') {
+    const target = arg || alias;
+    const proj = pm.getProject(target);
+    if (!proj) return { text: `错误: 未知项目 ${target}` };
+    if (!proj.started) return { text: `项目 ${target} 未启动` };
+    const r = await proj.agent.compact();
+    return { text: r.ok ? `已触发 ${target} 的会话压缩，进度见后续消息。` : `压缩失败: ${r.error}` };
+  }
+
+  // Unknown slash command — pass through to Codex as a normal message
   return null;
 }
 
@@ -2677,7 +2718,7 @@ function restoreScheduledMessages(pm, channelMap, thresholdMs) {
 
           const had = pendingMessages.has(alias);
           pendingMessages.set(alias, { text, chatId, channel, thresholdMs: jobThresholdMs ?? thresholdMs });
-          if (proj.claude.info().status === 'busy') {
+          if (proj.agent.info().status === 'busy') {
             let note = '⏰ 定时消息已到点，已加入队列。';
             if (had) note += '\n（已替换之前排队的消息）';
             try { await sendText(channel, chatId, note); } catch {}
@@ -2786,7 +2827,7 @@ function scheduleOneOffMessage(pm, alias, chatId, channel, thresholdMs, payload)
         thresholdMs,
       });
 
-      if (proj.claude.info().status === 'busy') {
+      if (proj.agent.info().status === 'busy') {
         let note = '⏰ 定时消息已到点，已加入队列。';
         if (had) note += '\n（已替换之前排队的消息）';
         try { await sendText(channel, chatId, note); } catch {}
@@ -2817,7 +2858,7 @@ function scheduleOneOffMessage(pm, alias, chatId, channel, thresholdMs, payload)
 }
 
 /**
- * Send Claude's reply back to Feishu.
+ * Send Codex's reply back to Feishu.
  * @param {object} replyCtx  - { incomingMessageId, reactionId } for cleaning up the typing indicator
  */
 async function sendReplyToFeishu(channel, chatId, replyText, replyCtx) {
@@ -2882,20 +2923,20 @@ async function sendReplyToFeishu(channel, chatId, replyText, replyCtx) {
 }
 
 /**
- * Process a Claude message and stream the reply to Feishu.
+ * Process a Codex message and stream the reply to Feishu.
  *
  * Uses Feishu's native streaming card (typewriter effect + auto-rollover
  * for content exceeding 30KB). Falls back to non-streaming send
  * (sendReplyToFeishu) if the stream fails to start.
  *
- * @param {ClaudeProcess} claude
- * @param {string} text - user message to send to Claude
+ * @param {CodexAppServer} agent
+ * @param {string} text - user message to send to Codex
  * @param {object} channel - LarkChannel instance
  * @param {string} chatId
  * @param {{ incomingMessageId?: string, reactionId?: string|null }} replyCtx
  * @returns {Promise<{text:string,sessionId:string,costUsd:number,interrupted?:boolean}|null>}
  */
-async function processAndReply(claude, text, channel, chatId, replyCtx) {
+async function processAndReply(agent, text, channel, chatId, replyCtx) {
   const { incomingMessageId } = replyCtx || {};
 
   const streamOpts = incomingMessageId ? { replyTo: incomingMessageId } : {};
@@ -2960,13 +3001,13 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
           // partial answer text (pushing partial text burned the ~50-edit/card
           // budget and left nothing for the final setContent).
           if (!hasRealContent && progressEditCount < PROGRESS_EDIT_CAP) {
-            const act = claude._lastActivity;
+            const act = agent._lastActivity;
             if (act) {
               // Key = activity type + tool name (ignore timestamp)
               const key = `${act.type}:${act.tool || ''}`;
               if (key !== lastActivityKey) {
                 lastActivityKey = key;
-                const progress = claude.progressText();
+                const progress = agent.progressText();
                 if (progress) {
                   progressEditCount++;
                   controller.setContent(`💭 ${progress}`).catch(() => {});
@@ -2999,13 +3040,13 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
         }, 1500);
 
         try {
-          finalResult = await claude.sendMessage(text, {
+          finalResult = await agent.sendMessage(text, {
             // onStream no longer pushes partial text to the card. We only use
             // it to detect when real answer text starts (vs tool markers) so
             // we can switch the card to a "generating" marker once. Tool
             // progress is already handled by progressTimer above.
             onStream: () => {
-              if (hasRealContent || !claude._hasAssistantText) return;
+              if (hasRealContent || !agent._hasAssistantText) return;
               hasRealContent = true;
               // Note: do NOT clearInterval(progressTimer) here — the heartbeat
               // must keep running (see comment in progressTimer). hasRealContent
@@ -3096,7 +3137,7 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
     }, streamOpts);
 
     // [concl] one concise line per turn with the signals that matter for
-    // diagnosing lost conclusions: did Claude produce text, did the SDK patch
+    // diagnosing lost conclusions: did Codex produce text, did the SDK patch
     // it (seq>0, matches), did a PATCH throw (streamingFailed), did it
     // rollover or exceed the element limit.
     if (streamController) {
@@ -3145,7 +3186,7 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
     if (!cardCreated) {
       // Stream failed to start — fall back to non-streaming send.
       // Show a "thinking" placeholder immediately so the user isn't
-      // left staring at silence while Claude processes.
+      // left staring at silence while Codex processes.
       console.warn('[WARN] stream failed to start, falling back:', e?.message || String(e));
       let placeholderMsgId = null;
 
@@ -3168,14 +3209,14 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
 
       // Periodically update placeholder with elapsed time & activity
       const fallbackTimer = setInterval(async () => {
-        const progress = claude.progressText();
+        const progress = agent.progressText();
         if (progress) {
           await updatePlaceholder(`💭 ${progress}`);
         }
       }, 3000);
 
       try {
-        const result = await claude.sendMessage(text);
+        const result = await agent.sendMessage(text);
         clearInterval(fallbackTimer);
         const replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
         await sendReplyToFeishu(channel, chatId, replyText, { incomingMessageId });
@@ -3231,7 +3272,7 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
 async function drainQueue(pm, alias) {
   const proj = pm.getProject(alias);
   if (!proj?.started) return;
-  if (proj.claude.info().status === 'busy') return;
+  if (proj.agent.info().status === 'busy') return;
 
   const entry = pendingMessages.get(alias);
   if (!entry) return;
@@ -3258,7 +3299,7 @@ async function drainQueue(pm, alias) {
     if (incomingMessageId && reactionId) {
       await removeReaction(channel.rawClient, incomingMessageId, reactionId);
     }
-    await processAndReply(proj.claude, text, channel, chatId, { incomingMessageId });
+    await processAndReply(proj.agent, text, channel, chatId, { incomingMessageId });
   } catch (e) {
     console.error(`[ERROR] drainQueue: ${e?.message || String(e)}`);
   } finally {
@@ -3278,8 +3319,8 @@ function handleCardAction(pm, alias, evt) {
 
     if (value.action === 'interrupt') {
       const proj = pm.getProject(alias);
-      if (proj?.started && proj.claude.info().status === 'busy') {
-        const ok = proj.claude.interrupt();
+      if (proj?.started && proj.agent.info().status === 'busy') {
+        const ok = proj.agent.interrupt();
         console.log(`[cardAction] interrupt on "${alias}": ${ok}`);
       }
     }
@@ -3389,14 +3430,14 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
                 if (r) {
                   replyText = String(r.text ?? '');
                 } else {
-                  // Unknown slash command — pass through to Claude Code (streaming)
+                  // Unknown slash command — pass through to Codex (streaming)
                   const proj = pm.getProject(alias);
                   if (!proj || !proj.started) {
                     replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
-                  } else if (proj.claude.info().status === 'busy') {
+                  } else if (proj.agent.info().status === 'busy') {
                     const had = pendingMessages.has(alias);
                     pendingMessages.set(alias, { text: trimmed, chatId, channel, thresholdMs, incomingMessageId: messageId });
-                    replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
+                    replyText = '⏳ Codex 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
                     if (had) replyText += '\n（已替换之前排队的消息）';
                     queued = true;
                   } else {
@@ -3405,7 +3446,7 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
                     if (messageId && reactionId) {
                       await removeReaction(channel.rawClient, messageId, reactionId);
                     }
-                    await processAndReply(proj.claude, trimmed, channel, chatId, { incomingMessageId: messageId });
+                    await processAndReply(proj.agent, trimmed, channel, chatId, { incomingMessageId: messageId });
                     replyText = null; // already sent via streaming
                   }
                 }
@@ -3422,10 +3463,10 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
                 fullText += `\n[附件: ${att.fileName || att.type || 'attachment'}]`;
               }
 
-              if (proj.claude.info().status === 'busy') {
+              if (proj.agent.info().status === 'busy') {
                 const had = pendingMessages.has(alias);
                 pendingMessages.set(alias, { text: fullText, chatId, channel, thresholdMs, incomingMessageId: messageId });
-                replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
+                replyText = '⏳ Codex 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
                 if (had) replyText += '\n（已替换之前排队的消息）';
                 queued = true;
               } else {
@@ -3434,7 +3475,7 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
                 if (messageId && reactionId) {
                   await removeReaction(channel.rawClient, messageId, reactionId);
                 }
-                await processAndReply(proj.claude, fullText, channel, chatId, { incomingMessageId: messageId });
+                await processAndReply(proj.agent, fullText, channel, chatId, { incomingMessageId: messageId });
                 replyText = null; // already sent via streaming
               }
             }
@@ -3556,18 +3597,18 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
                 if (r) {
                   replyText = String(r.text ?? '');
                 } else {
-                  // Unknown slash command — pass through to Claude Code
+                  // Unknown slash command — pass through to Codex
                   const proj = pm.getProject(alias);
                   if (!proj || !proj.started) {
                     replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
-                  } else if (proj.claude.info().status === 'busy') {
+                  } else if (proj.agent.info().status === 'busy') {
                     const had = pendingMessages.has(alias);
                     pendingMessages.set(alias, { text: trimmed, chatId, larkClient, thresholdMs, incomingMessageId: messageId });
-                    replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
+                    replyText = '⏳ Codex 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
                     if (had) replyText += '\n（已替换之前排队的消息）';
                     queued = true;
                   } else {
-                    const result = await proj.claude.sendMessage(trimmed);
+                    const result = await proj.agent.sendMessage(trimmed);
                     replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
                     if (!replyText.trim()) {
                       const costNote = result?.costUsd > 0 ? ` ($${result.costUsd})` : '';
@@ -3594,14 +3635,14 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
                 }
               }
 
-              if (proj.claude.info().status === 'busy') {
+              if (proj.agent.info().status === 'busy') {
                 const had = pendingMessages.has(alias);
                 pendingMessages.set(alias, { text: fullText, chatId, larkClient, thresholdMs, incomingMessageId: messageId });
-                replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
+                replyText = '⏳ Codex 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
                 if (had) replyText += '\n（已替换之前排队的消息）';
                 queued = true;
               } else {
-                const result = await proj.claude.sendMessage(fullText);
+                const result = await proj.agent.sendMessage(fullText);
                 replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
                 if (!replyText.trim()) {
                   const costNote = result?.costUsd > 0 ? ` ($${result.costUsd})` : '';
@@ -3664,13 +3705,26 @@ async function runSelfTest() {
   const r = parseMediaLines('hello\nMEDIA: /tmp/a.mp4\nworld');
   ok('MEDIA parsed', r.mediaUrls.length === 1 && r.text.includes('hello') && r.text.includes('world'));
 
-  // 4) ClaudeProcess construction
-  const cp = new ClaudeProcess({ workDir: '/tmp', claudePath: 'echo', sessionId: 'test-123' });
+  // 4) CodexAppServer construction
+  const cp = new CodexAppServer({ workDir: '/tmp', codexPath: 'codex', threadId: 'test-123' });
   const info = cp.info();
-  ok('ClaudeProcess info', info.status === 'idle' && info.sessionId === 'test-123' && info.turnCount === 0);
+  ok('CodexAppServer info', info.status === 'idle' && info.sessionId === 'test-123' && info.turnCount === 0);
+  ok('CodexAppServer backend tag', info.backend === 'codex');
 
   // 5) interrupt returns false when not busy
   ok('interrupt when idle', cp.interrupt() === false);
+
+  // 5b) managed codex config.toml generation
+  const toml = buildCodexConfigToml({
+    codexDefaults: { model: 'glm-5.2', provider: 'maas', approvalPolicy: 'never', sandbox: 'danger-full-access', contextWindow: null },
+    providers: {
+      maas: { name: 'MaaS', baseUrl: 'https://example.com/v1', envKey: 'MAAS_API_KEY', wireApi: 'responses' },
+    },
+  });
+  ok('toml: model', toml.includes('model = "glm-5.2"'));
+  ok('toml: provider ref', toml.includes('model_provider = "maas"'));
+  ok('toml: provider section', toml.includes('[model_providers.maas]') && toml.includes('env_key = "MAAS_API_KEY"'));
+  ok('toml: memories enabled', toml.includes('[features]') && toml.includes('memories = true'));
 
   // 6) pendingMessages single-slot queue
   pendingMessages.set('test', { text: 'a', chatId: 'c', channel: null, thresholdMs: 0 });
@@ -3749,21 +3803,24 @@ if (SELFTEST) {
 const bridgeConfig = loadBridgeConfig();
 if (bridgeConfig.debug) DEBUG = true;
 
-// Claude Code version check
+// Codex CLI version check
 try {
-  const verOut = execSync(`${bridgeConfig.claudePath} --version`, { encoding: 'utf8', timeout: 5000 }).trim();
+  const verOut = execFileSync(bridgeConfig.codexPath, ['--version'], { encoding: 'utf8', timeout: 5000 }).trim();
   const match = verOut.match(/(\d+\.\d+\.\d+)/);
-  if (match && match[1] !== EXPECTED_CLAUDE_VERSION) {
-    console.warn(`[WARN] Claude Code version ${match[1]} (expected ${EXPECTED_CLAUDE_VERSION}). Compatibility not guaranteed.`);
+  if (match && match[1] !== EXPECTED_CODEX_VERSION) {
+    console.warn(`[WARN] Codex version ${match[1]} (expected ${EXPECTED_CODEX_VERSION}). app-server protocol churns fast; compatibility not guaranteed.`);
   } else if (match) {
-    console.log(`[OK] Claude Code v${match[1]}`);
+    console.log(`[OK] Codex v${match[1]}`);
   } else {
-    console.warn(`[WARN] Could not parse Claude Code version: ${verOut}`);
+    console.warn(`[WARN] Could not parse Codex version: ${verOut}`);
   }
 } catch (e) {
-  console.error(`[ERROR] Cannot find claude CLI at "${bridgeConfig.claudePath}": ${e.message}`);
+  console.error(`[ERROR] Cannot find codex CLI at "${bridgeConfig.codexPath}": ${e.message}`);
   if (!SELFTEST) process.exit(1);
 }
+
+// Generate the managed Codex home (config.toml: providers, defaults, memories)
+ensureCodexHome(bridgeConfig);
 
 const pm = new ProjectManager(bridgeConfig);
 await pm.init();
