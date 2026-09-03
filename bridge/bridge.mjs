@@ -604,6 +604,7 @@ class CodexAppServer {
    *   provider?: string | null,
    *   sandbox?: string,
    *   approvalPolicy?: string,
+   *   contextWindow?: number | null,
    * }} opts
    */
   constructor({
@@ -614,6 +615,7 @@ class CodexAppServer {
     provider = null,
     sandbox = CODEX_DEFAULT_SANDBOX,
     approvalPolicy = CODEX_DEFAULT_APPROVAL,
+    contextWindow = null,
   }) {
     this._workDir = workDir;
     this._codexPath = codexPath;
@@ -622,6 +624,7 @@ class CodexAppServer {
     this._provider = provider;    // null = config.toml default
     this._sandbox = sandbox;
     this._approvalPolicy = approvalPolicy;
+    this._contextWindow = contextWindow; // null = config.toml default
 
     this._process = null;
     this._initialized = false;    // initialize handshake done for this process
@@ -740,6 +743,10 @@ class CodexAppServer {
       ...(this._provider ? { modelProvider: this._provider } : {}),
       approvalPolicy: this._approvalPolicy,
       sandbox: this._sandbox,
+      // Context window override (validated against codex 0.152.1): applied
+      // per thread via the free-form `config` object; the effective usable
+      // window is this value minus codex's headroom (~95%).
+      ...(this._contextWindow ? { config: { model_context_window: this._contextWindow } } : {}),
     };
 
     if (this._sessionId) {
@@ -1286,6 +1293,7 @@ class CodexAppServer {
       turnCount: this._turnCount,
       model: this._model || null,
       provider: this._provider || null,
+      contextWindow: this._contextWindow || null,
       backend: 'codex',
     };
   }
@@ -1435,7 +1443,12 @@ function loadBridgeConfig() {
       provider: cx.provider || null,
       sandbox: cx.sandbox || null,
       approvalPolicy: cx.approvalPolicy || null,
+      contextWindow: cx.contextWindow != null ? Number(cx.contextWindow) : null,
     };
+    if (proj.codex.contextWindow != null && !(proj.codex.contextWindow > 0)) {
+      console.error(`[FATAL] Project "${alias}" codex.contextWindow must be a positive number`);
+      process.exit(1);
+    }
   }
 
   // Model providers: defined once here, rendered into the managed
@@ -1543,6 +1556,7 @@ class ProjectManager {
         provider: cx.provider || defaults.provider,
         sandbox: cx.sandbox || defaults.sandbox,
         approvalPolicy: cx.approvalPolicy || defaults.approvalPolicy,
+        contextWindow: cx.contextWindow || defaults.contextWindow,
       });
 
       // Restore accumulated stats

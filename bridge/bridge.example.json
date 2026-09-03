@@ -19,7 +19,8 @@
       },
       "codex": {
         "model": "qwen3.8-max",
-        "provider": "maas"
+        "provider": "maas",
+        "contextWindow": 200000
       }
     },
     "minimal": {

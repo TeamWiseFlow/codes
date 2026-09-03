@@ -33,7 +33,8 @@ bridge.mjs (单 Node.js 进程)
 ├── CodexAppServer (每个项目一个) — 管理 codex app-server 子进程
 │     ├── start(): spawn codex app-server → initialize 握手 → initialized
 │     ├── _ensureThread(): thread/resume（有 threadId）或 thread/start；
-│     │     per-project 的 model/modelProvider/sandbox/approvalPolicy 覆盖在此应用
+│     │     per-project 的 model/modelProvider/sandbox/approvalPolicy/contextWindow
+│     │     覆盖在此应用（contextWindow 走 thread 级 config.model_context_window）
 │     ├── sendMessage(): turn/start 发送用户消息 → 等待 turn/completed
 │     │     ├── item/agentMessage/delta — 流式增量（飞书打字机卡片）
 │     │     ├── item/started/completed — 工具生命周期（进度提示）
@@ -74,7 +75,7 @@ codex 内置两阶段 memory 管线（会话结束后台提取结构化记忆 �
 
 ## Config
 
-- `~/.codes/bridge.json` — 项目配置（路径、飞书凭据、providers、codexDefaults、项目级 codex 覆盖）
+- `~/.codes/bridge.json` — 项目配置（路径、飞书凭据、providers、codexDefaults、项目级 codex 覆盖：model/provider/sandbox/approvalPolicy/contextWindow）
 - `~/.codes/bridge-sessions.json` — 会话持久化（自动管理；sessionId 即 codex thread id）
 - `~/.codes/codex-home/` — bridge 托管的 CODEX_HOME：config.toml（生成）、会话 rollout、memories
 - `bridge/.env` — 模型端点 API key（`providers.*.envKey` 对应变量）与可选调优变量

@@ -152,6 +152,7 @@ node bridge.mjs
 | `projects.*.codex.model` | 该项目的模型（覆盖默认） | `codexDefaults.model` |
 | `projects.*.codex.provider` | 该项目的 provider（须引用 `providers` 中的 key） | `codexDefaults.provider` |
 | `projects.*.codex.sandbox` | 沙箱模式（`read-only` / `workspace-write` / `danger-full-access`） | `danger-full-access` |
+| `projects.*.codex.contextWindow` | 该项目的上下文窗口（token，影响自动压缩时机；实际可用约为配置值的 95%） | `codexDefaults.contextWindow` |
 | `providers.<key>.baseUrl` | Responses 兼容端点（`/responses` 会自动拼接） | 必填 |
 | `providers.<key>.envKey` | 存放 API key 的环境变量名 | 必填 |
 | `providers.<key>.wireApi` | 协议（仅支持 `responses`） | `"responses"` |
