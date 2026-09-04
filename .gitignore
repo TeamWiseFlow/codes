@@ -5,4 +5,7 @@ bridge/bridge.json
 claude-code/
 .DS_Store
 *.log
-backups/
+backups/claude-code/
+codex/
+deepseek-harness/
+pi/

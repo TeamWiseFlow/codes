@@ -1,7 +1,3 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code when working with code in this repository.
-
 ## Project Overview
 
 Feishu-Codex Bridge: 将飞书机器人连接到 OpenAI 开源的 Codex CLI（`codex app-server`），通过飞书消息直接操控服务器上的 Codex 子进程。每个项目一个 `codex app-server` 子进程，走 JSON-RPC 2.0 over stdio（JSONL 分帧）。
@@ -88,7 +84,7 @@ codex 内置两阶段 memory 管线（会话结束后台提取结构化记忆 �
 - **过程卡只显示进度**: 最终结论一次性落卡（飞书流式卡编辑次数上限约 40 次的教训），进度编辑有 PROGRESS_EDIT_CAP，心跳 120s 一次
 - **processAndReply()**: 统一的 Codex→飞书回复函数，优先走 streaming 路径，stream 启动失败时 fallback 到非流式 sendReplyToFeishu()；表格多的结论 / 超长轮次绕过流式卡，另发普通卡片
 - **最终文本语义**: 一轮中最后一个 `agentMessage` item 的文本才是结论；工具调用之前的叙述文本在工具开始时丢弃（与历史 AtomCode `_finalText` 语义一致）
-- **消息队列**: 单槽设计（pendingMessages Map），Codex 忙碌时新消息排队（保留最新一条），处理完自动 drainQueue；busy 状态在 sendMessage 入口**同步**置位，杜绝并发双 turn
+- **忙碌时追加消息**: 优先走 `turn/steer` 并入当前轮次（expectedTurnId 前置条件）；steer 失败（如 compact/review 等不可 steering 轮次、turn id 不匹配）时降级为单槽排队（pendingMessages Map，保留最新一条），处理完自动 drainQueue；busy 状态在 sendMessage 入口**同步**置位，杜绝并发双 turn
 - **打断机制**: `/interrupt` → `turn/interrupt`，8 秒看门狗兜底强制收尾
 - **服务端请求必应答**: 审批（item/commandExecution/requestApproval 等）、询问（item/tool/requestUserInput）、elicitation 全部自动应答（accept / 空答案 / decline），未知请求回 JSON-RPC error —— 任何情况下不让 turn 挂起
 - **多 bot 初始化**: 每个 feishu.appId 对应独立的 createLarkChannel 实例，一个 bridge 进程可服务多个飞书 bot
