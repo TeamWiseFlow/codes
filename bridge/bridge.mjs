@@ -605,6 +605,7 @@ class CodexAppServer {
    *   sandbox?: string,
    *   approvalPolicy?: string,
    *   contextWindow?: number | null,
+   *   extraConfig?: Record<string, string | number | boolean | Array<string | number | boolean>> | null,
    * }} opts
    */
   constructor({
@@ -616,6 +617,7 @@ class CodexAppServer {
     sandbox = CODEX_DEFAULT_SANDBOX,
     approvalPolicy = CODEX_DEFAULT_APPROVAL,
     contextWindow = null,
+    extraConfig = null,
   }) {
     this._workDir = workDir;
     this._codexPath = codexPath;
@@ -625,6 +627,7 @@ class CodexAppServer {
     this._sandbox = sandbox;
     this._approvalPolicy = approvalPolicy;
     this._contextWindow = contextWindow; // null = config.toml default
+    this._extraConfig = extraConfig || null; // raw codex config keys (snake_case), highest precedence
 
     this._process = null;
     this._initialized = false;    // initialize handshake done for this process
@@ -743,10 +746,17 @@ class CodexAppServer {
       ...(this._provider ? { modelProvider: this._provider } : {}),
       approvalPolicy: this._approvalPolicy,
       sandbox: this._sandbox,
-      // Context window override (validated against codex 0.152.1): applied
-      // per thread via the free-form `config` object; the effective usable
-      // window is this value minus codex's headroom (~95%).
-      ...(this._contextWindow ? { config: { model_context_window: this._contextWindow } } : {}),
+      // Free-form config overrides (validated against codex 0.152.1): applied
+      // per thread via the `config` object, which codex merges as top-level
+      // config overrides (higher precedence than config.toml). The effective
+      // usable context window is the configured value minus codex headroom (~95%).
+      ...(() => {
+        const config = {
+          ...(this._contextWindow ? { model_context_window: this._contextWindow } : {}),
+          ...(this._extraConfig || {}),
+        };
+        return Object.keys(config).length ? { config } : {};
+      })(),
     };
 
     if (this._sessionId) {
@@ -856,6 +866,28 @@ class CodexAppServer {
       this._status = 'idle';
       this._busySince = null;
       this._lastActivity = null;
+    }
+  }
+
+  /**
+   * Steer the active turn with additional user input — the message is folded
+   * into the in-flight turn instead of waiting for the next one. Returns
+   * { ok: false } when no turn is active or the turn is not steerable
+   * (e.g. compaction/review turns), so the caller can queue as before.
+   */
+  async steer(text) {
+    if (this._status !== 'busy' || !this._turnId || !this._sessionId) {
+      return { ok: false, error: 'no active turn' };
+    }
+    try {
+      await this._send('turn/steer', {
+        threadId: this._sessionId,
+        input: [{ type: 'text', text }],
+        expectedTurnId: this._turnId,
+      }, CODEX_RPC_TIMEOUT_MS);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
     }
   }
 
@@ -1315,10 +1347,26 @@ class CodexAppServer {
 // pipeline have a single source of truth. Rollouts (sessions) and memories
 // also land here, which puts them inside the existing ~/.codes backup target.
 
-/** Serialize a JS value as a TOML value (strings/numbers/booleans only). */
+/** Serialize a JS value as a TOML value (scalars and arrays of scalars). */
 function toTomlValue(value) {
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return `[${value.map(toTomlValue).join(', ')}]`;
   return JSON.stringify(String(value)); // TOML basic strings ≈ JSON strings here
+}
+
+/** Emit an object as a TOML table (scalars first, nested objects as sub-tables). */
+function emitTomlTable(lines, header, obj) {
+  lines.push('', `[${header}]`);
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === null || v === undefined) continue;
+    if (typeof v === 'object' && !Array.isArray(v)) continue;
+    lines.push(`${k} = ${toTomlValue(v)}`);
+  }
+  for (const [k, v] of Object.entries(obj)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      emitTomlTable(lines, `${header}.${k}`, v);
+    }
+  }
 }
 
 function buildCodexConfigToml(config) {
@@ -1334,6 +1382,9 @@ function buildCodexConfigToml(config) {
   lines.push(`approval_policy = ${toTomlValue(d.approvalPolicy || CODEX_DEFAULT_APPROVAL)}`);
   lines.push(`sandbox_mode = ${toTomlValue(d.sandbox || CODEX_DEFAULT_SANDBOX)}`);
   if (d.contextWindow) lines.push(`model_context_window = ${toTomlValue(Number(d.contextWindow))}`);
+  for (const [key, value] of Object.entries(d.extraConfig || {})) {
+    lines.push(`${key} = ${toTomlValue(value)}`);
+  }
 
   // Cross-session persistent memory — replaces the old server-memory MCP.
   // Phase 1 extracts structured memories from finished rollouts in the
@@ -1357,6 +1408,11 @@ function buildCodexConfigToml(config) {
       `env_key = ${toTomlValue(p.envKey)}`,
       `wire_api = ${toTomlValue(p.wireApi || 'responses')}`,
     );
+  }
+
+  // MCP servers (migrated from Claude Code): passed through to codex as-is.
+  for (const [name, server] of Object.entries(config.mcpServers || {})) {
+    emitTomlTable(lines, `mcp_servers.${name}`, server);
   }
   return lines.join('\n') + '\n';
 }
@@ -1444,6 +1500,7 @@ function loadBridgeConfig() {
       sandbox: cx.sandbox || null,
       approvalPolicy: cx.approvalPolicy || null,
       contextWindow: cx.contextWindow != null ? Number(cx.contextWindow) : null,
+      extraConfig: extractExtraCodexConfig(cx, `projects."${alias}".codex`),
     };
     if (proj.codex.contextWindow != null && !(proj.codex.contextWindow > 0)) {
       console.error(`[FATAL] Project "${alias}" codex.contextWindow must be a positive number`);
@@ -1456,10 +1513,9 @@ function loadBridgeConfig() {
   const providers = raw.providers || {};
   // The key is interpolated as a TOML table name — restrict to bare keys so a
   // dot/space can't silently produce a nested table or invalid TOML.
-  const TOML_BARE_KEY = /^[A-Za-z0-9_-]+$/;
   for (const [key, p] of Object.entries(providers)) {
-    if (!TOML_BARE_KEY.test(key)) {
-      console.error(`[FATAL] providers key "${key}" must match ${TOML_BARE_KEY} (letters/digits/_/-)`);
+    if (!TOML_BARE_KEY_RE.test(key)) {
+      console.error(`[FATAL] providers key "${key}" must match ${TOML_BARE_KEY_RE} (letters/digits/_/-)`);
       process.exit(1);
     }
     if (!p.baseUrl || !p.envKey) {
@@ -1486,6 +1542,7 @@ function loadBridgeConfig() {
     sandbox: raw.codexDefaults?.sandbox || CODEX_DEFAULT_SANDBOX,
     approvalPolicy: raw.codexDefaults?.approvalPolicy || CODEX_DEFAULT_APPROVAL,
     contextWindow: raw.codexDefaults?.contextWindow ? Number(raw.codexDefaults.contextWindow) : null,
+    extraConfig: extractExtraCodexConfig(raw.codexDefaults, 'codexDefaults'),
   };
   if (codexDefaults.provider && !providers[codexDefaults.provider]) {
     console.error(`[FATAL] codexDefaults.provider "${codexDefaults.provider}" not defined in providers`);
@@ -1516,6 +1573,20 @@ function loadBridgeConfig() {
     };
   }
 
+  // MCP servers: passed through verbatim into config.toml [mcp_servers.<name>].
+  // Key names are interpolated as TOML table names, so restrict to bare keys.
+  const mcpServers = raw.mcpServers || {};
+  for (const [name, server] of Object.entries(mcpServers)) {
+    if (!TOML_BARE_KEY_RE.test(name)) {
+      console.error(`[FATAL] mcpServers key "${name}" must match ${TOML_BARE_KEY_RE} (letters/digits/_/-)`);
+      process.exit(1);
+    }
+    if (!server || typeof server !== 'object' || Array.isArray(server)) {
+      console.error(`[FATAL] mcpServers."${name}" must be an object`);
+      process.exit(1);
+    }
+  }
+
   return {
     projects,
     thinkingThresholdMs: Number(
@@ -1524,6 +1595,7 @@ function loadBridgeConfig() {
     codexPath: raw.codexPath || 'codex',
     providers,
     codexDefaults,
+    mcpServers,
     debug: raw.debug === true || DEBUG,
     backup,
   };
@@ -1533,6 +1605,34 @@ function loadBridgeConfig() {
 
 const SESSIONS_PATH = resolvePath('~/.codes/bridge-sessions.json');
 const SCHEDULED_PATH = resolvePath('~/.codes/bridge-scheduled.json');
+
+/** bridge.json codex keys with dedicated handling; everything else passes through verbatim. */
+const KNOWN_CODEX_KEYS = new Set(['model', 'provider', 'sandbox', 'approvalPolicy', 'contextWindow']);
+const TOML_BARE_KEY_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Extract unknown codex.* keys for verbatim passthrough. Keys must be TOML bare
+ * keys (they may be rendered into config.toml); values must be scalars or
+ * arrays of scalars so both config.toml and thread/start config can carry them.
+ */
+function extractExtraCodexConfig(source, where) {
+  const extra = {};
+  for (const [key, value] of Object.entries(source || {})) {
+    if (KNOWN_CODEX_KEYS.has(key)) continue;
+    if (!TOML_BARE_KEY_RE.test(key)) {
+      console.error(`[FATAL] ${where} key "${key}" must match ${TOML_BARE_KEY_RE} (codex config keys are snake_case)`);
+      process.exit(1);
+    }
+    const valid = ['string', 'number', 'boolean'].includes(typeof value)
+      || (Array.isArray(value) && value.every((v) => ['string', 'number', 'boolean'].includes(typeof v)));
+    if (!valid) {
+      console.error(`[FATAL] ${where} key "${key}" must be a string, number, boolean, or array of those`);
+      process.exit(1);
+    }
+    extra[key] = value;
+  }
+  return extra;
+}
 
 class ProjectManager {
   constructor(config) {
@@ -1557,6 +1657,7 @@ class ProjectManager {
         sandbox: cx.sandbox || defaults.sandbox,
         approvalPolicy: cx.approvalPolicy || defaults.approvalPolicy,
         contextWindow: cx.contextWindow || defaults.contextWindow,
+        extraConfig: { ...defaults.extraConfig, ...cx.extraConfig },
       });
 
       // Restore accumulated stats
@@ -1702,8 +1803,9 @@ class ProjectManager {
     const outFile = path.join(dest, `backup_${timestamp}.tar.gz`);
 
     // Collect targets. Everything the bridge owns lives under ~/.codes:
-    // bridge.json, sessions, scheduled messages, and the managed Codex home
-    // (config.toml, rollouts, memories). Logs are excluded below.
+    // bridge.json, secrets, models.json, and the managed Codex home
+    // (config.toml, rollouts, memories, skills). Logs and transient
+    // rebuildable state are excluded below.
     const targets = [];
     if (fs.existsSync(path.join(home, '.codes'))) targets.push('.codes');
 
@@ -1720,6 +1822,24 @@ class ProjectManager {
         '--exclude=.codes/logs',
         '--exclude=.codes/logs/*',
         '--exclude=.codes/bridge-sessions.json',
+        // Plugin marketplace sync cache (~98MB git clone) — re-downloaded on demand.
+        '--exclude=.codes/codex-home/.tmp',
+        '--exclude=.codes/codex-home/.tmp/*',
+        // Transient runtime state.
+        '--exclude=.codes/codex-home/tmp',
+        '--exclude=.codes/codex-home/tmp/*',
+        '--exclude=.codes/codex-home/shell_snapshots',
+        '--exclude=.codes/codex-home/shell_snapshots/*',
+        '--exclude=.codes/codex-home/thread-writer-locks',
+        '--exclude=.codes/codex-home/thread-writer-locks/*',
+        // Codex internal log DB (diagnostics only).
+        '--exclude=.codes/codex-home/logs_2.sqlite',
+        '--exclude=.codes/codex-home/logs_2.sqlite-wal',
+        '--exclude=.codes/codex-home/logs_2.sqlite-shm',
+        // Live SQLite sidecars: unsafe to tar while codex is running;
+        // main .sqlite files keep the last checkpointed state.
+        '--exclude=.codes/codex-home/*.sqlite-wal',
+        '--exclude=.codes/codex-home/*.sqlite-shm',
         '-czf', outFile,
         ...targets,
       ];
@@ -2445,7 +2565,7 @@ async function handleSlashCommand(pm, alias, text) {
         '/help               — 显示此帮助',
         '',
         '其他 / 开头的消息会作为普通消息转发给 Codex。',
-        'Codex 忙碌时发送的消息会自动排队（保留最新一条）。',
+        'Codex 忙碌时追加的消息会优先并入当前轮次；不支持时自动排队（保留最新一条）。',
         '',
         `当前项目: ${alias}`,
         `所有项目: ${pm.aliases().join(', ')}`,
@@ -2606,6 +2726,7 @@ async function handleSlashCommand(pm, alias, text) {
     const usage = proj.agent._lastUsage;
     const lines = [
       `项目 ${target} token 用量:`,
+      `模型: ${info.model || '(config.toml 默认)'} (provider: ${info.provider || '默认'})`,
       `累计: ${info.costUsd.toLocaleString()} tokens / ${info.turnCount} 轮`,
     ];
     if (usage?.last) {
@@ -2627,7 +2748,10 @@ async function handleSlashCommand(pm, alias, text) {
     if (!usage?.total) {
       return { text: `项目 ${target} 还没有用量数据，先发一条消息。` };
     }
-    const used = Number(usage.total.totalTokens || 0);
+    // Occupancy = last turn's total tokens (input+output ≈ active context),
+    // matching codex TUI's context-remaining calculation. `total` is the
+    // cumulative sum across ALL turns and must not be used as occupancy.
+    const used = Number(usage.last?.totalTokens || 0);
     const win = Number(usage.modelContextWindow || 0);
     const pct = win > 0 ? ` (${((used / win) * 100).toFixed(1)}%)` : '';
     const lines = [
@@ -2635,6 +2759,7 @@ async function handleSlashCommand(pm, alias, text) {
       win > 0
         ? `${used.toLocaleString()} / ${win.toLocaleString()} tokens${pct}`
         : `${used.toLocaleString()} tokens（上下文窗口大小未知）`,
+      `累计消耗: ${Number(usage.total?.totalTokens || 0).toLocaleString()} tokens`,
     ];
     if (win > 0 && used / win > 0.75) {
       lines.push('占用偏高，可用 /compact 压缩会话历史。');
@@ -3449,11 +3574,16 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
                   if (!proj || !proj.started) {
                     replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
                   } else if (proj.agent.info().status === 'busy') {
-                    const had = pendingMessages.has(alias);
-                    pendingMessages.set(alias, { text: trimmed, chatId, channel, thresholdMs, incomingMessageId: messageId });
-                    replyText = '⏳ Codex 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
-                    if (had) replyText += '\n（已替换之前排队的消息）';
-                    queued = true;
+                    const steerRes = await proj.agent.steer(trimmed);
+                    if (steerRes.ok) {
+                      replyText = '⤴️ 已并入当前处理轮次。';
+                    } else {
+                      const had = pendingMessages.has(alias);
+                      pendingMessages.set(alias, { text: trimmed, chatId, channel, thresholdMs, incomingMessageId: messageId });
+                      replyText = '⏳ Codex 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
+                      if (had) replyText += '\n（已替换之前排队的消息）';
+                      queued = true;
+                    }
                   } else {
                     // Stream the reply to Feishu
                     if (timer) clearTimeout(timer);
@@ -3478,11 +3608,16 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
               }
 
               if (proj.agent.info().status === 'busy') {
-                const had = pendingMessages.has(alias);
-                pendingMessages.set(alias, { text: fullText, chatId, channel, thresholdMs, incomingMessageId: messageId });
-                replyText = '⏳ Codex 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
-                if (had) replyText += '\n（已替换之前排队的消息）';
-                queued = true;
+                const steerRes = await proj.agent.steer(fullText);
+                if (steerRes.ok) {
+                  replyText = '⤴️ 已并入当前处理轮次。';
+                } else {
+                  const had = pendingMessages.has(alias);
+                  pendingMessages.set(alias, { text: fullText, chatId, channel, thresholdMs, incomingMessageId: messageId });
+                  replyText = '⏳ Codex 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
+                  if (had) replyText += '\n（已替换之前排队的消息）';
+                  queued = true;
+                }
               } else {
                 // Stream the reply to Feishu
                 if (timer) clearTimeout(timer);
@@ -3730,7 +3865,11 @@ async function runSelfTest() {
 
   // 5b) managed codex config.toml generation
   const toml = buildCodexConfigToml({
-    codexDefaults: { model: 'glm-5.2', provider: 'maas', approvalPolicy: 'never', sandbox: 'danger-full-access', contextWindow: null },
+    codexDefaults: {
+      model: 'glm-5.2', provider: 'maas', approvalPolicy: 'never', sandbox: 'danger-full-access',
+      contextWindow: null,
+      extraConfig: { model_reasoning_summary: 'none', model_reasoning_effort: 'xhigh', project_doc_fallback_filenames: ['CLAUDE.md'] },
+    },
     providers: {
       maas: { name: 'MaaS', baseUrl: 'https://example.com/v1', envKey: 'MAAS_API_KEY', wireApi: 'responses' },
     },
@@ -3739,6 +3878,8 @@ async function runSelfTest() {
   ok('toml: provider ref', toml.includes('model_provider = "maas"'));
   ok('toml: provider section', toml.includes('[model_providers.maas]') && toml.includes('env_key = "MAAS_API_KEY"'));
   ok('toml: memories enabled', toml.includes('[features]') && toml.includes('memories = true'));
+  ok('toml: extra config passthrough', toml.includes('model_reasoning_summary = "none"') && toml.includes('model_reasoning_effort = "xhigh"'));
+  ok('toml: extra config array', toml.includes('project_doc_fallback_filenames = ["CLAUDE.md"]'));
 
   // 6) pendingMessages single-slot queue
   pendingMessages.set('test', { text: 'a', chatId: 'c', channel: null, thresholdMs: 0 });

@@ -153,11 +153,13 @@ node bridge.mjs
 | `projects.*.codex.provider` | 该项目的 provider（须引用 `providers` 中的 key） | `codexDefaults.provider` |
 | `projects.*.codex.sandbox` | 沙箱模式（`read-only` / `workspace-write` / `danger-full-access`） | `danger-full-access` |
 | `projects.*.codex.contextWindow` | 该项目的上下文窗口（token，影响自动压缩时机；实际可用约为配置值的 95%） | `codexDefaults.contextWindow` |
+| `projects.*.codex.*` | 其余任意 codex 配置键（snake_case，如 `model_reasoning_summary`、`model_reasoning_effort`）原样透传给该项目会话（thread/start config，优先级最高） | `codexDefaults.*` |
 | `providers.<key>.baseUrl` | Responses 兼容端点（`/responses` 会自动拼接） | 必填 |
 | `providers.<key>.envKey` | 存放 API key 的环境变量名 | 必填 |
 | `providers.<key>.wireApi` | 协议（仅支持 `responses`） | `"responses"` |
 | `codexDefaults.model` / `.provider` | 全局默认模型 / provider | — |
 | `codexDefaults.contextWindow` | 上下文窗口大小（token） | — |
+| `codexDefaults.*` | 其余任意 codex 配置键（snake_case）渲染进 `config.toml`（全局默认，项目级同名键可覆盖） | — |
 | `thinkingThresholdMs` | thinking 状态提示阈值（ms） | 2500 |
 | `codexPath` | codex CLI 路径（systemd 下建议绝对路径） | `"codex"` |
 | `debug` | 调试模式 | `false` |
@@ -169,9 +171,13 @@ node bridge.mjs
 
 本机环境若无法创建 user namespace（常见于 AppArmor 限制的 Ubuntu），codex 的 bubblewrap 沙箱不可用，默认配置为 `danger-full-access` + `approvalPolicy: never`（代理在受信服务器上自主执行，与多数生产部署姿态一致）。若你的环境支持沙箱，可在 `codexDefaults` / 项目级 `codex` 里改成 `workspace-write`。
 
+### 第三方模型的上下文窗口上限
+
+`model_context_window` 会受模型元数据里 `max_context_window` 的硬性钳制。Codex 不认识的模型（如 GLM、Qwen）会落入 fallback 元数据（上限 272k，可用约 258k），配置 1M 也会被钳到 272k。解决办法：提供一个自定义模型目录（`models.json`，含 `context_window` / `max_context_window` / `model_messages.instructions_template`），并在 `codexDefaults` 里设 `model_catalog_json = "/path/to/models.json"`（全局生效，重启 bridge 后渲染进 config.toml）。注意该目录会**替换**内置目录，需要把所有在用的第三方模型都列进去。
+
 ### 自动备份
 
-bridge 内置每日定时备份，默认凌晨 04:16 将 `~/.codes`（bridge.json、sessions、codex-home（含会话与记忆）；排除 `logs/` 和 `bridge-sessions.json`）打包为 `backup_YYYYMMDD_HHmm.tar.gz`。设为 `false` 可禁用；飞书发 `/backup` 随时手动触发。
+bridge 内置每日定时备份，默认凌晨 04:16 将 `~/.codes` 的核心内容（bridge.json、secrets、models.json、codex-home 的 config/sessions/memories/skills）打包为 `backup_YYYYMMDD_HHmm.tar.gz`。排除项：`logs/`、`bridge-sessions.json`、codex-home 的插件同步缓存（`.tmp/`，可按需重建）、内部日志库（`logs_2.sqlite*`）、运行时临时目录、以及 SQLite 的 `-wal`/`-shm` 活动侧车文件（运行中打包不安全；主 `.sqlite` 保留最近检查点）。设为 `false` 可禁用；飞书发 `/backup` 随时手动触发。
 
 ### .env 调优（可选）
 

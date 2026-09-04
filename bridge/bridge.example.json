@@ -20,7 +20,9 @@
       "codex": {
         "model": "qwen3.8-max",
         "provider": "maas",
-        "contextWindow": 200000
+        "contextWindow": 200000,
+        "model_reasoning_effort": "xhigh",
+        "model_reasoning_summary": "none"
       }
     },
     "minimal": {
@@ -42,7 +44,10 @@
   "codexDefaults": {
     "model": "glm-5.2",
     "provider": "maas",
-    "contextWindow": 200000
+    "contextWindow": 200000,
+    "project_doc_fallback_filenames": [
+      "CLAUDE.md"
+    ]
   },
   "thinkingThresholdMs": 2500,
   "codexPath": "codex",
@@ -50,5 +55,18 @@
   "backup": {
     "time": "04:16",
     "dest": "~/Backups"
+  },
+  "mcpServers": {
+    "example-stdio": {
+      "command": "/absolute/path/to/npx",
+      "args": [
+        "-y",
+        "some-mcp-package"
+      ]
+    },
+    "example-http": {
+      "url": "https://mcp.example.com/v1",
+      "bearer_token_env_var": "EXAMPLE_MCP_TOKEN"
+    }
   }
 }
