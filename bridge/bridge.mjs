@@ -3718,7 +3718,7 @@ async function runSelfTest() {
   // Model and effort move together for /hard; /reset and /start restore defaults.
   const profileCalls = [];
   const profileAgent = new CodexAppServer({
-    workDir: '/tmp', model: 'gpt-6-sol', reasoningEffort: 'xhigh',
+    workDir: '/tmp', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh',
   });
   profileAgent.start = async () => {};
   profileAgent._send = async (method, params) => {
@@ -3729,7 +3729,7 @@ async function runSelfTest() {
   };
   await profileAgent._ensureThread();
   ok('new thread uses default model and effort',
-    profileCalls[0].params.model === 'gpt-6-sol'
+    profileCalls[0].params.model === 'gpt-6.1-sol'
     && profileCalls[0].params.config.model_reasoning_effort === 'xhigh');
   const profilePm = new ProjectManager({});
   profilePm._saveSessions = () => {};
@@ -3746,12 +3746,12 @@ async function runSelfTest() {
   await profileAgent._ensureThread();
   const resetParams = profileCalls.filter((call) => call.method === 'thread/start').at(-1)?.params;
   ok('/reset restores Sol and xhigh for a fresh thread',
-    resetParams?.model === 'gpt-6-sol' && resetParams?.config.model_reasoning_effort === 'xhigh');
+    resetParams?.model === 'gpt-6.1-sol' && resetParams?.config.model_reasoning_effort === 'xhigh');
   await handleSlashCommand(profilePm, 'profile', '/hard');
   await profilePm.stopProject('profile');
   await profilePm.startProject('profile');
   ok('/start restores default profile',
-    profileAgent.info().model === 'gpt-6-sol' && profileAgent.info().reasoningEffort === 'xhigh');
+    profileAgent.info().model === 'gpt-6.1-sol' && profileAgent.info().reasoningEffort === 'xhigh');
 
   // 6) pendingMessages single-slot queue
   pendingMessages.set('test', { text: 'a', chatId: 'c', channel: null, thresholdMs: 0 });

@@ -139,7 +139,7 @@ node bridge.mjs
 | `debug` | 调试模式 | `false` |
 | `backup` | 可选手动备份配置（如 `{ "dest": "~/Backups" }`） | `false` |
 
-默认不传模型、推理强度、provider、沙箱、审批或上下文配置覆盖，全部由本机 Codex 决定。可通过 `codexDefaults.model` 和 `codexDefaults.reasoningEffort` 设置所有项目的新会话及 `/reset` 默认值，例如 `gpt-6-sol` 和 `xhigh`；`projects.*.codex` 可覆盖单个项目。provider 必须已在本机 Codex 中定义。旧的 `providers`、`mcpServers` 字段不再生成配置，需要在本机 Codex 中维护。
+默认不传模型、推理强度、provider、沙箱、审批或上下文配置覆盖，全部由本机 Codex 决定。可通过 `codexDefaults.model` 和 `codexDefaults.reasoningEffort` 设置所有项目的新会话及 `/reset` 默认值，例如 `gpt-6.1-sol` 和 `xhigh`；`projects.*.codex` 可覆盖单个项目。provider 必须已在本机 Codex 中定义。旧的 `providers`、`mcpServers` 字段不再生成配置，需要在本机 Codex 中维护。
 
 bridge 不再安排每日备份。仅显式配置 `backup.dest` 后，`/backup` 才能手动打包 `.codes`；它不包含默认 `~/.codex`。
 
