@@ -1,7 +1,7 @@
 /**
  * Feishu ↔ Codex Bridge
  *
- * Drives one Codex CLI `app-server` subprocess per project and bridges its
+ * Drives one Codex CLI `app-server` subprocess per conversation and bridges its
  * full IO to Feishu bots (the interaction UI). Codex is OpenAI's open-source
  * coding agent; the app-server subcommand exposes a JSON-RPC 2.0 stdio
  * protocol (JSONL framing) that supports streaming deltas, interrupts,
@@ -10,23 +10,22 @@
  * Architecture:
  *   bridge.mjs (single Node.js process)
  *     ├── loadBridgeConfig() — reads ~/.codes/bridge.json
- *     ├── ensureCodexHome() — generates ~/.codes/codex-home/config.toml
- *     │     (providers, default model, built-in memories pipeline)
- *     ├── CodexAppServer (one per project) — manages codex subprocess
+ *     ├── Uses the local Codex configuration and default home unchanged
+ *     ├── CodexAppServer (one per conversation) — manages codex subprocess
  *     │     ├── spawn: codex app-server (stdio JSON-RPC, JSONL)
  *     │     ├── initialize → thread/start | thread/resume (session = thread id)
  *     │     ├── turn/start sends user text; item/agentMessage/delta streams
  *     │     │   the answer; turn/completed ends the turn
  *     │     ├── turn/interrupt cancels an in-flight turn
  *     │     └── respawn: next message re-initializes and resumes the thread
- *     └── FeishuBot (one per project) — manages Feishu WebSocket connection
+ *     └── FeishuBot (one per bot app) — manages Feishu WebSocket connection
  *           ├── createLarkChannel (one per bot app)
  *           ├── channel.on({ message, cardAction, ... })
  *           └── channel.send / channel.stream replies
  *
  * Config: ~/.codes/bridge.json
  * Sessions: ~/.codes/bridge-sessions.json (auto-saved)
- * Codex home: ~/.codes/codex-home (generated config.toml, rollouts, memories)
+ * Codex home: local default (~/.codex), or inherited CODEX_HOME; never generated
  */
 
 import * as Lark from '@larksuiteoapi/node-sdk';
@@ -41,6 +40,11 @@ import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { spawn, execFileSync } from 'node:child_process';
 import util from 'node:util';
+import {
+  indexBotProjects, conversationKey, isBotMentioned, isOwnMessage,
+  groupMessageRecord, buildGroupPrompt, GroupMessageBuffer,
+} from './conversations.mjs';
+import { BridgeNoticeRegistry } from './notices.mjs';
 
 // ─── Console timestamp + rotating-file logging ─────────────────
 // loguru-style size rotation, zero deps, in-process: console.* is redirected
@@ -167,7 +171,7 @@ let DEBUG = process.env.FEISHU_BRIDGE_DEBUG === '1';
 const BRIDGE_VERSION = readBridgeVersion();
 // Protocol-tested codex CLI version. app-server protocol churns fast
 // (stable releases every 2-4 days); a mismatch is a warning, not fatal.
-const EXPECTED_CODEX_VERSION = '0.152.1';
+const EXPECTED_CODEX_VERSION = '0.159.2';
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
@@ -363,15 +367,14 @@ function scheduleCleanup(filePath, minutes = INBOUND_FILE_TTL_MIN) {
   if (typeof t.unref === 'function') t.unref();
 }
 
-/** Returns milliseconds until the next daily occurrence of HH:MM (local time).
- *  Guarantees at least 1 hour delay to prevent double-firing when called within
- *  the same minute as the scheduled time (e.g. setTimeout fires a few seconds early). */
-function msUntilDailyTime(hour, minute) {
-  const now = new Date();
-  const next = new Date(now);
-  next.setHours(hour, minute, 0, 0);
-  if (next.getTime() - now.getTime() < 3_600_000) next.setDate(next.getDate() + 1);
-  return next.getTime() - now.getTime();
+function withTimeout(promise, ms, message) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 function looksLikeMediaRef(s) {
@@ -566,9 +569,9 @@ function cleanupTempFile(filePath) {
 
 // ─── CodexAppServer ─────────────────────────────────────────────
 // Bridges one Codex CLI `app-server` subprocess (JSON-RPC 2.0 over stdio,
-// newline-delimited JSON) to a Feishu project. One process per project.
+// newline-delimited JSON) to a Feishu project. One process per conversation.
 //
-// Wire protocol (validated against codex-cli 0.152.1):
+// Wire protocol (validated against codex-cli 0.159.2):
 //   → initialize + initialized          handshake, once per connection
 //   → thread/start | thread/resume      open / continue a thread; the
 //                                       thread id IS the persisted session
@@ -580,16 +583,10 @@ function cleanupTempFile(filePath) {
 //   ← item/*/requestApproval            server-initiated request — MUST reply
 //   → turn/interrupt                    cancel an in-flight turn
 //
-// Sandbox/approval stance: this host cannot run codex's bubblewrap sandbox
-// (user namespaces are restricted), so threads default to
-// sandbox=danger-full-access + approvalPolicy=never — the exact security
-// posture the previous Claude backend ran with (--dangerously-skip-permissions).
-// Server-initiated approval requests should therefore never occur; if one
-// ever does (config change), it is auto-answered so the turn cannot hang.
-
-const CODEX_HOME = resolvePath('~/.codes/codex-home');
-const CODEX_DEFAULT_SANDBOX = 'danger-full-access';
-const CODEX_DEFAULT_APPROVAL = 'never';
+// Inherit local Codex configuration unless an explicit thread override is set.
+const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const CODEX_DEFAULT_SANDBOX = null;
+const CODEX_DEFAULT_APPROVAL = null;
 const CODEX_INIT_TIMEOUT_MS = 60_000;
 const CODEX_RPC_TIMEOUT_MS = 30_000;
 const CODEX_INTERRUPT_WATCHDOG_MS = 8_000;
@@ -601,6 +598,7 @@ class CodexAppServer {
    *   codexPath?: string,
    *   threadId?: string | null,
    *   model?: string | null,
+   *   reasoningEffort?: string | null,
    *   provider?: string | null,
    *   sandbox?: string,
    *   approvalPolicy?: string,
@@ -613,6 +611,7 @@ class CodexAppServer {
     codexPath = 'codex',
     threadId = null,
     model = null,
+    reasoningEffort = null,
     provider = null,
     sandbox = CODEX_DEFAULT_SANDBOX,
     approvalPolicy = CODEX_DEFAULT_APPROVAL,
@@ -623,6 +622,9 @@ class CodexAppServer {
     this._codexPath = codexPath;
     this._sessionId = threadId;   // codex thread id (rollout persisted by codex)
     this._model = model;          // null = config.toml default
+    this._reasoningEffort = reasoningEffort; // null = config.toml default
+    this._defaultModel = model;
+    this._defaultReasoningEffort = reasoningEffort;
     this._provider = provider;    // null = config.toml default
     this._sandbox = sandbox;
     this._approvalPolicy = approvalPolicy;
@@ -691,7 +693,7 @@ class CodexAppServer {
     const proc = spawn(this._codexPath, ['app-server'], {
       cwd: this._workDir,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, CODEX_HOME },
+      env: { ...process.env },
     });
     this._process = proc;
 
@@ -744,9 +746,9 @@ class CodexAppServer {
     const overrides = {
       ...(this._model ? { model: this._model } : {}),
       ...(this._provider ? { modelProvider: this._provider } : {}),
-      approvalPolicy: this._approvalPolicy,
-      sandbox: this._sandbox,
-      // Free-form config overrides (validated against codex 0.152.1): applied
+      ...(this._approvalPolicy ? { approvalPolicy: this._approvalPolicy } : {}),
+      ...(this._sandbox ? { sandbox: this._sandbox } : {}),
+      // Free-form config overrides (validated against codex 0.159.2): applied
       // per thread via the `config` object, which codex merges as top-level
       // config overrides (higher precedence than config.toml). The effective
       // usable context window is the configured value minus codex headroom (~95%).
@@ -754,6 +756,7 @@ class CodexAppServer {
         const config = {
           ...(this._contextWindow ? { model_context_window: this._contextWindow } : {}),
           ...(this._extraConfig || {}),
+          ...(this._reasoningEffort ? { model_reasoning_effort: this._reasoningEffort } : {}),
         };
         return Object.keys(config).length ? { config } : {};
       })(),
@@ -821,9 +824,10 @@ class CodexAppServer {
           threadId: this._sessionId,
           input: [{ type: 'text', text }],
         };
-        // The turn-level model override also re-pins the thread default, so
-        // a runtime /model switch takes effect immediately and stays sticky.
+        // Turn-level overrides re-pin the thread settings, so runtime
+        // /model and /hard switches take effect on the next message.
         if (this._model) turnParams.model = this._model;
+        if (this._reasoningEffort) turnParams.effort = this._reasoningEffort;
 
         const res = await this._send('turn/start', turnParams, CODEX_RPC_TIMEOUT_MS);
         return res.turn;
@@ -1324,6 +1328,7 @@ class CodexAppServer {
       costUsd: this._costUsd, // total tokens (not USD — provider-dependent pricing)
       turnCount: this._turnCount,
       model: this._model || null,
+      reasoningEffort: this._reasoningEffort || null,
       provider: this._provider || null,
       contextWindow: this._contextWindow || null,
       backend: 'codex',
@@ -1338,105 +1343,6 @@ class CodexAppServer {
       return `正在处理… ${elapsed} | 工具: ${act.tool}`;
     }
     return `正在思考… ${elapsed}`;
-  }
-}
-
-// ─── Codex home (managed config.toml) ───────────────────────────
-// The bridge owns $CODEX_HOME (~/.codes/codex-home): config.toml is generated
-// from bridge.json on startup, so providers, defaults and the memories
-// pipeline have a single source of truth. Rollouts (sessions) and memories
-// also land here, which puts them inside the existing ~/.codes backup target.
-
-/** Serialize a JS value as a TOML value (scalars and arrays of scalars). */
-function toTomlValue(value) {
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-  if (Array.isArray(value)) return `[${value.map(toTomlValue).join(', ')}]`;
-  return JSON.stringify(String(value)); // TOML basic strings ≈ JSON strings here
-}
-
-/** Emit an object as a TOML table (scalars first, nested objects as sub-tables). */
-function emitTomlTable(lines, header, obj) {
-  lines.push('', `[${header}]`);
-  for (const [k, v] of Object.entries(obj)) {
-    if (v === null || v === undefined) continue;
-    if (typeof v === 'object' && !Array.isArray(v)) continue;
-    lines.push(`${k} = ${toTomlValue(v)}`);
-  }
-  for (const [k, v] of Object.entries(obj)) {
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
-      emitTomlTable(lines, `${header}.${k}`, v);
-    }
-  }
-}
-
-function buildCodexConfigToml(config) {
-  const d = config.codexDefaults;
-  const lines = [
-    '# Generated by feishu-codes-bridge — manual edits are overwritten on startup.',
-    '# Source of truth: ~/.codes/bridge.json (providers / codexDefaults).',
-    '# Per-project model/provider overrides are applied via thread/start params.',
-    '',
-  ];
-  if (d.model) lines.push(`model = ${toTomlValue(d.model)}`);
-  if (d.provider) lines.push(`model_provider = ${toTomlValue(d.provider)}`);
-  lines.push(`approval_policy = ${toTomlValue(d.approvalPolicy || CODEX_DEFAULT_APPROVAL)}`);
-  lines.push(`sandbox_mode = ${toTomlValue(d.sandbox || CODEX_DEFAULT_SANDBOX)}`);
-  if (d.contextWindow) lines.push(`model_context_window = ${toTomlValue(Number(d.contextWindow))}`);
-  for (const [key, value] of Object.entries(d.extraConfig || {})) {
-    lines.push(`${key} = ${toTomlValue(value)}`);
-  }
-
-  // Cross-session persistent memory — replaces the old server-memory MCP.
-  // Phase 1 extracts structured memories from finished rollouts in the
-  // background; Phase 2 consolidates them globally under $CODEX_HOME/memories.
-  lines.push(
-    '',
-    '[features]',
-    'memories = true',
-    '',
-    '[memories]',
-    'use_memories = true',
-    'generate_memories = true',
-  );
-
-  for (const [key, p] of Object.entries(config.providers)) {
-    lines.push(
-      '',
-      `[model_providers.${key}]`,
-      `name = ${toTomlValue(p.name || key)}`,
-      `base_url = ${toTomlValue(p.baseUrl)}`,
-      `env_key = ${toTomlValue(p.envKey)}`,
-      `wire_api = ${toTomlValue(p.wireApi || 'responses')}`,
-    );
-  }
-
-  // MCP servers (migrated from Claude Code): passed through to codex as-is.
-  for (const [name, server] of Object.entries(config.mcpServers || {})) {
-    emitTomlTable(lines, `mcp_servers.${name}`, server);
-  }
-  return lines.join('\n') + '\n';
-}
-
-/** Write the managed config.toml (only when changed) and validate env keys. */
-function ensureCodexHome(config) {
-  fs.mkdirSync(CODEX_HOME, { recursive: true });
-  const target = path.join(CODEX_HOME, 'config.toml');
-  const desired = buildCodexConfigToml(config);
-  let current = null;
-  try { current = fs.readFileSync(target, 'utf8'); } catch {}
-  if (current !== desired) {
-    const tmp = target + '.tmp';
-    fs.writeFileSync(tmp, desired);
-    fs.renameSync(tmp, target);
-    console.log(`[OK] Codex config written: ${target}`);
-  }
-  for (const [key, p] of Object.entries(config.providers)) {
-    if (!process.env[p.envKey]) {
-      console.warn(
-        `[WARN] provider "${key}" expects env var ${p.envKey}, but it is not set ` +
-        `(add it to bridge/.env)`,
-      );
-    }
   }
 }
 
@@ -1490,12 +1396,12 @@ function loadBridgeConfig() {
     proj.feishu.appSecretPath = resolvePath(proj.feishu.appSecretPath);
 
     // Per-project Codex overrides (all optional — defaults come from the
-    // top-level `codexDefaults` / generated config.toml). `provider` must
-    // reference a key in the top-level `providers` map (or a provider already
-    // defined in a hand-maintained config.toml).
+    // top-level `codexDefaults` / local Codex config.toml). Providers are
+    // configured in the local Codex config.toml.
     const cx = proj.codex || {};
     proj.codex = {
       model: cx.model || null,
+      reasoningEffort: cx.reasoningEffort || null,
       provider: cx.provider || null,
       sandbox: cx.sandbox || null,
       approvalPolicy: cx.approvalPolicy || null,
@@ -1508,84 +1414,30 @@ function loadBridgeConfig() {
     }
   }
 
-  // Model providers: defined once here, rendered into the managed
-  // ~/.codes/codex-home/config.toml ([model_providers.<key>]) on startup.
-  const providers = raw.providers || {};
-  // The key is interpolated as a TOML table name — restrict to bare keys so a
-  // dot/space can't silently produce a nested table or invalid TOML.
-  for (const [key, p] of Object.entries(providers)) {
-    if (!TOML_BARE_KEY_RE.test(key)) {
-      console.error(`[FATAL] providers key "${key}" must match ${TOML_BARE_KEY_RE} (letters/digits/_/-)`);
-      process.exit(1);
-    }
-    if (!p.baseUrl || !p.envKey) {
-      console.error(`[FATAL] providers.${key} needs "baseUrl" and "envKey" in bridge.json`);
-      process.exit(1);
-    }
-    if (p.wireApi && p.wireApi !== 'responses') {
-      console.error(`[FATAL] providers.${key}.wireApi must be "responses" (codex dropped "chat")`);
-      process.exit(1);
-    }
+  if (raw.providers || raw.mcpServers) {
+    console.warn('[WARN] bridge.json providers/mcpServers are no longer managed; configure them in your local Codex config.toml.');
   }
-  // Validate per-project provider references against the providers map.
-  for (const [alias, proj] of Object.entries(projects)) {
-    const prov = proj.codex.provider;
-    if (prov && !providers[prov]) {
-      console.error(`[FATAL] Project "${alias}" codex.provider "${prov}" not defined in providers`);
-      process.exit(1);
-    }
+
+  try {
+    indexBotProjects(projects);
+  } catch (e) {
+    console.error(`[FATAL] ${e.message}`);
+    process.exit(1);
   }
 
   const codexDefaults = {
     model: raw.codexDefaults?.model || null,
+    reasoningEffort: raw.codexDefaults?.reasoningEffort || null,
     provider: raw.codexDefaults?.provider || null,
     sandbox: raw.codexDefaults?.sandbox || CODEX_DEFAULT_SANDBOX,
     approvalPolicy: raw.codexDefaults?.approvalPolicy || CODEX_DEFAULT_APPROVAL,
     contextWindow: raw.codexDefaults?.contextWindow ? Number(raw.codexDefaults.contextWindow) : null,
     extraConfig: extractExtraCodexConfig(raw.codexDefaults, 'codexDefaults'),
   };
-  if (codexDefaults.provider && !providers[codexDefaults.provider]) {
-    console.error(`[FATAL] codexDefaults.provider "${codexDefaults.provider}" not defined in providers`);
-    process.exit(1);
-  }
-
-  // Backup config (optional — set to false to disable)
-  let backup;
-  if (raw.backup === false) {
-    backup = null;
-  } else {
-    const timeStr = String(raw.backup?.time ?? '04:16');
-    const m = timeStr.match(/^(\d{1,2}):(\d{2})$/);
-    if (!m) {
-      console.error(`[FATAL] backup.time 格式无效（应为 HH:MM）: ${timeStr}`);
-      process.exit(1);
-    }
-    const hour = Number(m[1]);
-    const minute = Number(m[2]);
-    if (hour > 23 || minute > 59) {
-      console.error(`[FATAL] backup.time 超出范围: ${timeStr}`);
-      process.exit(1);
-    }
-    backup = {
-      hour,
-      minute,
-      dest: resolvePath(String(raw.backup?.dest ?? '~/Backups')),
-    };
-  }
-
-  // MCP servers: passed through verbatim into config.toml [mcp_servers.<name>].
-  // Key names are interpolated as TOML table names, so restrict to bare keys.
-  const mcpServers = raw.mcpServers || {};
-  for (const [name, server] of Object.entries(mcpServers)) {
-    if (!TOML_BARE_KEY_RE.test(name)) {
-      console.error(`[FATAL] mcpServers key "${name}" must match ${TOML_BARE_KEY_RE} (letters/digits/_/-)`);
-      process.exit(1);
-    }
-    if (!server || typeof server !== 'object' || Array.isArray(server)) {
-      console.error(`[FATAL] mcpServers."${name}" must be an object`);
-      process.exit(1);
-    }
-  }
+  // Backups are manual and opt-in; there is no daily scheduler.
+  const backup = raw.backup && typeof raw.backup === 'object'
+    ? { dest: resolvePath(String(raw.backup.dest ?? '~/Backups')) }
+    : null;
 
   return {
     projects,
@@ -1593,9 +1445,7 @@ function loadBridgeConfig() {
       raw.thinkingThresholdMs ?? process.env.FEISHU_THINKING_THRESHOLD_MS ?? 2500,
     ),
     codexPath: raw.codexPath || 'codex',
-    providers,
     codexDefaults,
-    mcpServers,
     debug: raw.debug === true || DEBUG,
     backup,
   };
@@ -1607,13 +1457,12 @@ const SESSIONS_PATH = resolvePath('~/.codes/bridge-sessions.json');
 const SCHEDULED_PATH = resolvePath('~/.codes/bridge-scheduled.json');
 
 /** bridge.json codex keys with dedicated handling; everything else passes through verbatim. */
-const KNOWN_CODEX_KEYS = new Set(['model', 'provider', 'sandbox', 'approvalPolicy', 'contextWindow']);
+const KNOWN_CODEX_KEYS = new Set(['model', 'reasoningEffort', 'provider', 'sandbox', 'approvalPolicy', 'contextWindow']);
 const TOML_BARE_KEY_RE = /^[A-Za-z0-9_-]+$/;
 
 /**
  * Extract unknown codex.* keys for verbatim passthrough. Keys must be TOML bare
- * keys (they may be rendered into config.toml); values must be scalars or
- * arrays of scalars so both config.toml and thread/start config can carry them.
+ * keys; values must be scalars or arrays of scalars for thread/start config.
  */
 function extractExtraCodexConfig(source, where) {
   const extra = {};
@@ -1639,51 +1488,100 @@ class ProjectManager {
     this._config = config;
     /** @type {Map<string, {agent: CodexAppServer, started: boolean, path: string, feishuAppId: string}>} */
     this._projects = new Map();
+    this.groupMessages = new GroupMessageBuffer();
+    this.notices = new BridgeNoticeRegistry();
+  }
+
+  _createProject(alias, projectAlias, saved = {}) {
+    const proj = this._config.projects[projectAlias];
+    const cx = proj.codex || {};
+    const defaults = this._config.codexDefaults || {};
+    const agent = new CodexAppServer({
+      workDir: proj.path,
+      codexPath: this._config.codexPath,
+      threadId: saved.sessionId || null,
+      model: cx.model || defaults.model,
+      reasoningEffort: cx.reasoningEffort || defaults.reasoningEffort,
+      provider: cx.provider || defaults.provider,
+      sandbox: cx.sandbox || defaults.sandbox,
+      approvalPolicy: cx.approvalPolicy || defaults.approvalPolicy,
+      contextWindow: cx.contextWindow || defaults.contextWindow,
+      extraConfig: { ...defaults.extraConfig, ...cx.extraConfig },
+    });
+    agent._costUsd = Number(saved.costUsd) || 0;
+    agent._turnCount = Number(saved.turnCount) || 0;
+    const instance = {
+      agent, started: true, path: proj.path, feishuAppId: proj.feishu.appId,
+      backend: 'codex', projectAlias,
+      chatType: saved.chatType || null, chatId: saved.chatId || null,
+      replyPending: false, generation: 0,
+    };
+    this._projects.set(alias, instance);
+    return instance;
+  }
+
+  getConversation(projectAlias, chatType, chatId) {
+    const config = this._config.projects[projectAlias];
+    if (!config || !['group', 'p2p'].includes(chatType) || !chatId) return null;
+    const base = this._projects.get(projectAlias);
+    // Preserve the old alias/thread for the first private conversation.
+    // Every group uses a separate instance of this same project's config.
+    if (base && chatType === 'p2p' && (!base.chatId || base.chatId === chatId)) {
+      const newlyBound = !base.chatId;
+      base.chatType = chatType;
+      base.chatId = chatId;
+      if (newlyBound) this._saveSessions();
+      return { alias: projectAlias, project: base };
+    }
+    const key = conversationKey(projectAlias, chatType, chatId);
+    let project = this._projects.get(key);
+    if (project && (project.projectAlias !== projectAlias || project.chatType !== chatType || project.chatId !== chatId)) {
+      throw new Error(`Conversation key conflicts with a configured project: ${key}`);
+    }
+    if (!project) {
+      project = this._createProject(key, projectAlias, { chatType, chatId });
+      this._saveSessions();
+    }
+    return { alias: key, project };
+  }
+
+  resolveTarget(currentAlias, target) {
+    const current = this.getProject(currentAlias);
+    if (!current?.chatId || !this._config.projects?.[target]) return target;
+    return this.getConversation(target, current.chatType, current.chatId).alias;
+  }
+
+  _restoreProjects(saved) {
+    for (const alias of Object.keys(this._config.projects)) {
+      const state = saved[alias];
+      // The base alias remains the legacy private entry; groups always use
+      // a key containing the project alias and their chat ID.
+      const compatible = state && (!state.chatType || state.chatType === 'p2p');
+      this._createProject(alias, alias, compatible ? state : undefined);
+    }
+    for (const [alias, state] of Object.entries(saved)) {
+      if (this._projects.has(alias) || !this._config.projects[state.projectAlias]
+        || !state.chatId || !['p2p', 'group'].includes(state.chatType)
+        || alias !== conversationKey(state.projectAlias, state.chatType, state.chatId)) continue;
+      this._createProject(alias, state.projectAlias, state);
+    }
   }
 
   async init() {
-    const saved = this._loadSessions();
-
-    for (const [alias, proj] of Object.entries(this._config.projects)) {
-      const sessionId = saved[alias]?.sessionId || null;
-      const cx = proj.codex || {};
-      const defaults = this._config.codexDefaults;
-      const agent = new CodexAppServer({
-        workDir: proj.path,
-        codexPath: this._config.codexPath,
-        threadId: sessionId,
-        model: cx.model || defaults.model,
-        provider: cx.provider || defaults.provider,
-        sandbox: cx.sandbox || defaults.sandbox,
-        approvalPolicy: cx.approvalPolicy || defaults.approvalPolicy,
-        contextWindow: cx.contextWindow || defaults.contextWindow,
-        extraConfig: { ...defaults.extraConfig, ...cx.extraConfig },
-      });
-
-      // Restore accumulated stats
-      if (saved[alias]?.costUsd) agent._costUsd = Number(saved[alias].costUsd) || 0;
-      if (saved[alias]?.turnCount) agent._turnCount = Number(saved[alias].turnCount) || 0;
-
-      this._projects.set(alias, {
-        agent,
-        started: true,
-        path: proj.path,
-        feishuAppId: proj.feishu.appId,
-        backend: 'codex',
-      });
-    }
+    this._restoreProjects(this._loadSessions());
+    this.notices = new BridgeNoticeRegistry(resolvePath('~/.codes/bridge-notices.json'));
+    this.groupMessages = new GroupMessageBuffer(resolvePath('~/.codes/bridge-group-messages.json'));
+    this.groupMessages.prune((record) => this.notices.has(record.messageId));
 
     // Auto-save sessions every 60s
     this._saveInterval = setInterval(() => this._saveSessions(), 60_000);
     if (this._saveInterval.unref) this._saveInterval.unref();
 
-    this._scheduleBackup();
-
     // Save on process exit, kill all subprocesses
     const saveAndExit = async () => {
       this._saveSessions();
       await this.stopAll();
-      for (const ch of channelMap.values()) {
+      for (const ch of new Set(channelMap.values())) {
         try { await ch.disconnect(); } catch {}
       }
       process.exit(0);
@@ -1700,6 +1598,8 @@ class ProjectManager {
     const proj = this._projects.get(alias);
     if (!proj) return { ok: false, error: `未知项目: ${alias}` };
     if (proj.started) return { ok: true, message: `${alias} 已在运行中` };
+    proj.agent._model = proj.agent._defaultModel;
+    proj.agent._reasoningEffort = proj.agent._defaultReasoningEffort;
     proj.agent.restart();
     proj.started = true;
     return { ok: true, message: `${alias} 已启动` };
@@ -1711,6 +1611,9 @@ class ProjectManager {
     if (!proj.started) return { ok: true, message: `${alias} 已处于停止状态` };
     await proj.agent.stop();
     proj.started = false;
+    const pending = pendingMessages.get(alias);
+    if (pending?.groupRecords) this.groupMessages.restore(alias, pending.groupRecords);
+    pendingMessages.delete(alias);
     this._saveSessions();
     return { ok: true, message: `${alias} 已停止` };
   }
@@ -1718,15 +1621,21 @@ class ProjectManager {
   async resetProject(alias) {
     const proj = this._projects.get(alias);
     if (!proj) return { ok: false, error: `未知项目: ${alias}` };
+    this.groupMessages.clear(alias);
+    proj.generation = (proj.generation || 0) + 1;
+    proj.started = false;
+    pendingMessages.delete(alias);
     await proj.agent.stop();
     proj.agent._sessionId = null;
     proj.agent._threadReady = false;
+    proj.agent._model = proj.agent._defaultModel;
+    proj.agent._reasoningEffort = proj.agent._defaultReasoningEffort;
     proj.agent._costUsd = 0;
     proj.agent._turnCount = 0;
     proj.agent.restart();
     proj.started = true;
     this._saveSessions();
-    return { ok: true, message: `${alias} 会话已重置，下次对话将开始新会话` };
+    return { ok: true, message: `${alias} 会话已重置，下次对话将开始新会话（${proj.agent._model || 'Codex 默认模型'} + ${proj.agent._reasoningEffort || '默认推理强度'}）` };
   }
 
   async startAll() {
@@ -1749,7 +1658,7 @@ class ProjectManager {
     const out = {};
     for (const [alias, proj] of this._projects) {
       const info = proj.agent.info();
-      out[alias] = { started: proj.started, path: proj.path, ...info };
+      out[alias] = { started: proj.started, path: proj.path, chatType: proj.chatType, chatId: proj.chatId, ...info };
     }
     return out;
   }
@@ -1765,25 +1674,6 @@ class ProjectManager {
       }
     } catch {}
     return {};
-  }
-
-  _scheduleBackup() {
-    const backup = this._config.backup;
-    if (!backup) return;
-
-    const { hour, minute, dest } = backup;
-    const delay = msUntilDailyTime(hour, minute);
-    const nextRun = new Date(Date.now() + delay);
-    console.log(
-      `[BACKUP] 已调度每日备份 ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}，` +
-      `下次执行: ${formatLocalDateTime(nextRun.toISOString())}，目标: ${dest}`,
-    );
-
-    this._backupTimer = setTimeout(async () => {
-      await this._runBackup(dest);
-      this._scheduleBackup(); // 次日同一时间再次执行
-    }, delay);
-    if (this._backupTimer.unref) this._backupTimer.unref();
   }
 
   async _runBackup(dest) {
@@ -1802,10 +1692,8 @@ class ProjectManager {
       .slice(0, 15);
     const outFile = path.join(dest, `backup_${timestamp}.tar.gz`);
 
-    // Collect targets. Everything the bridge owns lives under ~/.codes:
-    // bridge.json, secrets, models.json, and the managed Codex home
-    // (config.toml, rollouts, memories, skills). Logs and transient
-    // rebuildable state are excluded below.
+    // Manual backup covers bridge data and any retained legacy home in ~/.codes.
+    // The local Codex home (~/.codex) is independent and is not included.
     const targets = [];
     if (fs.existsSync(path.join(home, '.codes'))) targets.push('.codes');
 
@@ -1878,6 +1766,9 @@ class ProjectManager {
         sessionId: info.sessionId,
         costUsd: info.costUsd,
         turnCount: info.turnCount,
+        projectAlias: proj.projectAlias,
+        chatType: proj.chatType,
+        chatId: proj.chatId,
       };
     }
     try {
@@ -1908,17 +1799,6 @@ function isDuplicate(key) {
 }
 
 // ─── Feishu message parsing ─────────────────────────────────────
-
-function shouldRespondInGroup(text, mentions) {
-  if (mentions.length > 0) return true;
-  const t = text.toLowerCase();
-  if (/[？?]$/.test(text)) return true;
-  if (/\b(why|how|what|when|where|who|help)\b/.test(t)) return true;
-  const verbs = ['帮', '麻烦', '请', '能否', '可以', '解释', '看看', '排查', '分析', '总结', '写', '改', '修', '查', '对比', '翻译'];
-  if (verbs.some((k) => text.includes(k))) return true;
-  if (/^(codes|bot|助手|智能体)[\s,:，：]/i.test(text)) return true;
-  return false;
-}
 
 function extractFromPostJson(postJson) {
   const lines = [];
@@ -2286,16 +2166,25 @@ async function buildInboundFromFeishuMessage(client, message) {
 
 // ─── Feishu sending (text + media) ──────────────────────────────
 
-async function sendText(channel, chatId, text) {
-  try {
-    return await channel.send(chatId, { text });
-  } catch {
-    // Fallback to raw API if channel.send fails
-    return channel.rawClient.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }) },
-    });
-  }
+async function sendText(channel, chatId, text, notice = false) {
+  const send = async () => {
+    try {
+      return await channel.send(chatId, { text });
+    } catch {
+      // Fallback to raw API if channel.send fails
+      return channel.rawClient.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }) },
+      });
+    }
+  };
+  if (!notice || !channel.bridgeNotices) return send();
+  // Register the exact text chunks too: SDK sends long plain text separately,
+  // and their events may arrive before it returns the complete chunkIds list.
+  const limit = channel.sender?.chunkLimit || 3500;
+  const texts = [text];
+  for (let start = 0; start < text.length; start += limit) texts.push(text.slice(start, start + limit));
+  return channel.bridgeNotices.send(chatId, texts, send);
 }
 
 /**
@@ -2345,29 +2234,32 @@ function shouldUseMarkdownCard(text) {
  * Send text as an interactive markdown card (interactive message type).
  * This renders code blocks, tables, bold/italic etc. properly in Feishu.
  */
-async function sendMarkdownCard(channel, chatId, text, replyToMessageId) {
+async function sendMarkdownCard(channel, chatId, text, replyToMessageId, notice = false) {
   const card = buildMarkdownCard(text);
   const opts = replyToMessageId ? { replyTo: replyToMessageId } : {};
 
-  try {
-    return await channel.send(chatId, { card }, opts);
-  } catch {
-    // Fallback to raw API if channel.send fails
-    const content = JSON.stringify(card);
-    if (replyToMessageId) {
-      try {
-        const res = await channel.rawClient.im.v1.message.reply({
-          path: { message_id: replyToMessageId },
-          data: { content, msg_type: 'interactive' },
-        });
-        if (res?.code === 0 || res?.code === undefined) return res;
-      } catch {}
+  const send = async () => {
+    try {
+      return await channel.send(chatId, { card }, opts);
+    } catch {
+      // Fallback to raw API if channel.send fails
+      const content = JSON.stringify(card);
+      if (replyToMessageId) {
+        try {
+          const res = await channel.rawClient.im.v1.message.reply({
+            path: { message_id: replyToMessageId },
+            data: { content, msg_type: 'interactive' },
+          });
+          if (res?.code === 0 || res?.code === undefined) return res;
+        } catch {}
+      }
+      return channel.rawClient.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, msg_type: 'interactive', content },
+      });
     }
-    return channel.rawClient.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: { receive_id: chatId, msg_type: 'interactive', content },
-    });
-  }
+  };
+  return notice && channel.bridgeNotices ? channel.bridgeNotices.send(chatId, text, send) : send();
 }
 
 
@@ -2541,6 +2433,7 @@ async function handleSlashCommand(pm, alias, text) {
   const parts = raw.split(/\s+/);
   const cmd = parts[0].toLowerCase();
   const arg = parts[1] || '';
+  const resolveTarget = (target) => pm.resolveTarget?.(alias, target) || target;
 
   if (cmd === '/help' || cmd === '/?') {
     return {
@@ -2555,6 +2448,7 @@ async function handleSlashCommand(pm, alias, text) {
         '/status             — 查看所有项目状态',
         '/backup             — 立即触发一次备份',
         '/model [名称] [alias] — 查看或切换模型（如 glm-5.2 / qwen3.8-max）',
+        '/hard [alias]       — 切换到 gpt-6-astra + high（下次消息生效）',
         '/cost [alias]       — 查看 token 用量',
         '/context [alias]    — 查看上下文窗口占用',
         '/compact [alias]    — 压缩会话历史',
@@ -2565,7 +2459,9 @@ async function handleSlashCommand(pm, alias, text) {
         '/help               — 显示此帮助',
         '',
         '其他 / 开头的消息会作为普通消息转发给 Codex。',
-        'Codex 忙碌时追加的消息会优先并入当前轮次；不支持时自动排队（保留最新一条）。',
+        'Codex 忙碌时追加的消息会优先并入当前轮次；失败时排队（群聊合并，私聊保留最新一条）。',
+        '群聊 Slash 命令无需 @；普通消息仅响应 @ 当前机器人，其余消息累积为下次请求的背景。',
+        '/clear 和 /reset 同时清空当前聊天尚未发送给 AI 的背景消息。',
         '',
         `当前项目: ${alias}`,
         `所有项目: ${pm.aliases().join(', ')}`,
@@ -2576,7 +2472,7 @@ async function handleSlashCommand(pm, alias, text) {
   if (cmd === '/backup') {
     const backup = pm._config.backup;
     if (!backup) {
-      return { text: '备份未启用（bridge.json 中 backup 设为 false）。' };
+      return { text: '手动备份未启用；可在 bridge.json 中设置 backup.dest。' };
     }
     const result = await pm._runBackup(backup.dest);
     if (result.ok) {
@@ -2596,17 +2492,21 @@ async function handleSlashCommand(pm, alias, text) {
       const turns = info.turnCount > 0 ? `${info.turnCount}轮` : '';
       const session = info.sessionId ? `thread=${info.sessionId.slice(0, 8)}…` : '';
       const model = info.model ? `model=${info.model}` : '';
+      const effort = info.reasoningEffort ? `effort=${info.reasoningEffort}` : '';
       const queued = pendingMessages.has(a) ? '📨 有排队消息' : '';
       const scheduledCount = getScheduledJobCount(a);
       const scheduled = scheduledCount > 0 ? `⏰ ${scheduledCount}个定时` : '';
-      const details = [pid, model, tokens, turns, session, queued, scheduled].filter(Boolean).join(' ');
+      const bufferedCount = pm.groupMessages.count(a);
+      const buffered = bufferedCount > 0 ? `💬 ${bufferedCount}条群聊背景` : '';
+      const chat = info.chatType ? `${info.chatType}=${info.chatId}` : '';
+      const details = [chat, pid, model, effort, tokens, turns, session, queued, scheduled, buffered].filter(Boolean).join(' ');
       lines.push(`${flag} ${a} (${info.path})${details ? ' — ' + details : ''}`);
     }
     return { text: lines.join('\n') };
   }
 
   if (cmd === '/scheduled') {
-    const target = arg || alias;
+    const target = resolveTarget(arg || alias);
     const proj = pm.getProject(target);
     if (!proj) return { text: `错误: 未知项目 ${target}` };
 
@@ -2630,7 +2530,7 @@ async function handleSlashCommand(pm, alias, text) {
 
   if (cmd === '/unschedule') {
     const idOrAll = parts[1] || '';
-    const target = parts[2] || alias;
+    const target = resolveTarget(parts[2] || alias);
     const proj = pm.getProject(target);
     if (!proj) return { text: `错误: 未知项目 ${target}` };
 
@@ -2662,7 +2562,7 @@ async function handleSlashCommand(pm, alias, text) {
       await pm.startAll();
       return { text: '所有项目已启动' };
     }
-    const target = arg || alias;
+    const target = resolveTarget(arg || alias);
     const r = await pm.startProject(target);
     return { text: r.ok ? r.message : `错误: ${r.error}` };
   }
@@ -2672,27 +2572,40 @@ async function handleSlashCommand(pm, alias, text) {
       await pm.stopAll();
       return { text: '所有项目已停止' };
     }
-    const target = arg || alias;
+    const target = resolveTarget(arg || alias);
     const r = await pm.stopProject(target);
     return { text: r.ok ? r.message : `错误: ${r.error}` };
   }
 
   if (cmd === '/reset' || cmd === '/clear') {
-    const target = arg || alias;
+    const target = resolveTarget(arg || alias);
     const r = await pm.resetProject(target);
     return { text: r.ok ? r.message : `错误: ${r.error}` };
   }
 
   if (cmd === '/interrupt') {
-    const target = arg || alias;
+    const target = resolveTarget(arg || alias);
     const proj = pm.getProject(target);
     if (!proj?.started) return { text: `项目 ${target} 未启动` };
     const ok = proj.agent.interrupt();
     return { text: ok ? `已发送打断信号给 ${target}` : `${target} 当前没有在处理消息` };
   }
 
+  if (cmd === '/hard') {
+    const target = resolveTarget(arg || alias);
+    const proj = pm.getProject(target);
+    if (!proj) return { text: `错误: 未知项目 ${target}` };
+    if (!proj.started) return { text: `项目 ${target} 未启动，请先 /start。` };
+    if (proj.agent.info().status === 'busy') {
+      return { text: `项目 ${target} 正在处理消息，请先等待完成或 /interrupt 打断后再切换模型。` };
+    }
+    proj.agent._model = 'gpt-6-astra';
+    proj.agent._reasoningEffort = 'high';
+    return { text: `✅ 项目 ${target} 已切换到 gpt-6-astra + high\n下次消息起生效。` };
+  }
+
   if (cmd === '/model') {
-    const target = parts[2] || alias;
+    const target = resolveTarget(parts[2] || alias);
     const proj = pm.getProject(target);
     if (!proj) return { text: `错误: 未知项目 ${target}` };
 
@@ -2701,7 +2614,7 @@ async function handleSlashCommand(pm, alias, text) {
       const current = info.model || '(config.toml 默认)';
       const prov = info.provider || '(默认)';
       return {
-        text: `项目 ${target} 当前模型: ${current} (provider: ${prov})\n` +
+        text: `项目 ${target} 当前模型: ${current} (推理强度: ${info.reasoningEffort || '默认'}, provider: ${prov})\n` +
           '用法: /model <模型名> [alias]\n' +
           '示例: /model glm-5.2\n      /model qwen3.8-max',
       };
@@ -2719,7 +2632,7 @@ async function handleSlashCommand(pm, alias, text) {
   }
 
   if (cmd === '/cost') {
-    const target = arg || alias;
+    const target = resolveTarget(arg || alias);
     const proj = pm.getProject(target);
     if (!proj) return { text: `错误: 未知项目 ${target}` };
     const info = proj.agent.info();
@@ -2741,7 +2654,7 @@ async function handleSlashCommand(pm, alias, text) {
   }
 
   if (cmd === '/context') {
-    const target = arg || alias;
+    const target = resolveTarget(arg || alias);
     const proj = pm.getProject(target);
     if (!proj) return { text: `错误: 未知项目 ${target}` };
     const usage = proj.agent._lastUsage;
@@ -2768,7 +2681,7 @@ async function handleSlashCommand(pm, alias, text) {
   }
 
   if (cmd === '/compact') {
-    const target = arg || alias;
+    const target = resolveTarget(arg || alias);
     const proj = pm.getProject(target);
     if (!proj) return { text: `错误: 未知项目 ${target}` };
     if (!proj.started) return { text: `项目 ${target} 未启动` };
@@ -2780,7 +2693,7 @@ async function handleSlashCommand(pm, alias, text) {
   return null;
 }
 
-// ─── Message queue (single-slot per project) ─────────────────────
+// ─── Message queue (private: latest message; group: merged batches) ──
 
 const pendingMessages = new Map(); // alias → { text, chatId, channel, thresholdMs }
 const scheduledMessages = new Map(); // alias → Map<jobId, { timer, chatId, text, runAt, thresholdMs }>
@@ -2798,6 +2711,7 @@ function saveScheduledMessages() {
           text: job.text,
           runAt: job.runAt,
           thresholdMs: job.thresholdMs,
+          chatType: job.chatType,
         });
       }
     }
@@ -2810,7 +2724,18 @@ function saveScheduledMessages() {
   }
 }
 
-function restoreScheduledMessages(pm, channelMap, thresholdMs) {
+async function resolveScheduledConversation(pm, alias, job, channel) {
+  const project = pm.getProject(alias);
+  if (!project) return null;
+  let chatType = job.chatType || (project.chatId === job.chatId ? project.chatType : null);
+  if (!chatType) {
+    const mode = await withTimeout(channel.getChatMode(job.chatId), 8000, 'Scheduled message chat lookup timed out');
+    chatType = mode === 'p2p' ? 'p2p' : 'group';
+  }
+  return pm.getConversation(project.projectAlias, chatType, job.chatId);
+}
+
+async function restoreScheduledMessages(pm, channelMap, thresholdMs) {
   if (!fs.existsSync(SCHEDULED_PATH)) return 0;
   let data;
   try {
@@ -2823,13 +2748,23 @@ function restoreScheduledMessages(pm, channelMap, thresholdMs) {
   let count = 0;
   for (const [alias, jobs] of Object.entries(data)) {
     if (!Array.isArray(jobs)) continue;
-    const channel = channelMap.get(alias);
-    if (!channel) continue;
+    const project = pm.getProject(alias);
+    const channel = channelMap.get(project?.projectAlias || alias);
+    if (!channel || !project) continue;
     for (const job of jobs) {
       const { jobId, chatId, text, runAt, thresholdMs: jobThresholdMs } = job;
       if (!jobId || !chatId || !text || !runAt) continue;
       const runAtMs = new Date(runAt).getTime();
       if (isNaN(runAtMs)) continue;
+      let conversation;
+      try {
+        conversation = await resolveScheduledConversation(pm, alias, job, channel);
+      } catch (e) {
+        console.warn(`[SCHED] Cannot restore ${jobId}: ${e.message}`);
+        continue;
+      }
+      if (!conversation) continue;
+      const targetAlias = conversation.alias;
 
       // Already past — fire immediately with a late notice
       const delayMs = Math.max(0, runAtMs - now);
@@ -2837,41 +2772,40 @@ function restoreScheduledMessages(pm, channelMap, thresholdMs) {
 
       const timer = setTimeout(() => {
         void (async () => {
-          clearScheduledJob(alias, jobId);
+          clearScheduledJob(targetAlias, jobId);
           saveScheduledMessages();
 
           if (isLate) {
             try {
-              await sendText(channel, chatId, `⏰ 定时消息（延迟送达，原定 ${formatLocalDateTime(runAt)}）：\n${text}`);
+              await sendText(channel, chatId, `⏰ 定时消息（延迟送达，原定 ${formatLocalDateTime(runAt)}）：\n${text}`, true);
             } catch {}
             return;
           }
 
-          const proj = pm.getProject(alias);
+          const proj = pm.getProject(targetAlias);
           if (!proj?.started) {
             try {
-              await sendText(channel, chatId, `⏰ 定时消息未发送：项目 ${alias} 未启动。\n消息内容：${text}`);
+              await sendText(channel, chatId, `⏰ 定时消息未发送：项目 ${targetAlias} 未启动。\n消息内容：${text}`, true);
             } catch {}
             return;
           }
 
-          const had = pendingMessages.has(alias);
-          pendingMessages.set(alias, { text, chatId, channel, thresholdMs: jobThresholdMs ?? thresholdMs });
-          if (proj.agent.info().status === 'busy') {
+          const queued = queuePendingMessage(pm, targetAlias, { text, chatId, channel, thresholdMs: jobThresholdMs ?? thresholdMs });
+          if (proj.replyPending || proj.agent.info().status === 'busy') {
             let note = '⏰ 定时消息已到点，已加入队列。';
-            if (had) note += '\n（已替换之前排队的消息）';
-            try { await sendText(channel, chatId, note); } catch {}
+            if (queued.had) note += queued.merged ? '\n（已合并之前排队的群聊消息）' : '\n（已替换之前排队的消息）';
+            try { await sendText(channel, chatId, note, true); } catch {}
             return;
           }
-          try { await sendText(channel, chatId, `⏰ 定时消息已发送：${text}`); } catch {}
-          await drainQueue(pm, alias);
+          try { await sendText(channel, chatId, `⏰ 定时消息已发送：${text}`, true); } catch {}
+          await drainQueue(pm, targetAlias);
         })();
       }, delayMs);
       if (typeof timer.unref === 'function') timer.unref();
 
-      let jobs2 = scheduledMessages.get(alias);
-      if (!jobs2) { jobs2 = new Map(); scheduledMessages.set(alias, jobs2); }
-      jobs2.set(jobId, { timer, chatId, text, runAt, thresholdMs: jobThresholdMs ?? thresholdMs });
+      let jobs2 = scheduledMessages.get(targetAlias);
+      if (!jobs2) { jobs2 = new Map(); scheduledMessages.set(targetAlias, jobs2); }
+      jobs2.set(jobId, { timer, chatId, text, runAt, chatType: conversation.project.chatType, thresholdMs: jobThresholdMs ?? thresholdMs });
       count++;
     }
   }
@@ -2953,27 +2887,27 @@ function scheduleOneOffMessage(pm, alias, chatId, channel, thresholdMs, payload)
             channel,
             chatId,
             `⏰ 定时消息未发送：项目 ${alias} 未启动。\n消息内容：${payload.text}`,
+            true,
           );
         } catch {}
         return;
       }
 
-      const had = pendingMessages.has(alias);
-      pendingMessages.set(alias, {
+      const queued = queuePendingMessage(pm, alias, {
         text: payload.text,
         chatId,
         channel,
         thresholdMs,
       });
 
-      if (proj.agent.info().status === 'busy') {
+      if (proj.replyPending || proj.agent.info().status === 'busy') {
         let note = '⏰ 定时消息已到点，已加入队列。';
-        if (had) note += '\n（已替换之前排队的消息）';
-        try { await sendText(channel, chatId, note); } catch {}
+        if (queued.had) note += queued.merged ? '\n（已合并之前排队的群聊消息）' : '\n（已替换之前排队的消息）';
+        try { await sendText(channel, chatId, note, true); } catch {}
         return;
       }
 
-      try { await sendText(channel, chatId, `⏰ 定时消息已发送：${payload.text}`); } catch {}
+      try { await sendText(channel, chatId, `⏰ 定时消息已发送：${payload.text}`, true); } catch {}
       await drainQueue(pm, alias);
     })();
   }, delayMs);
@@ -2990,6 +2924,7 @@ function scheduleOneOffMessage(pm, alias, chatId, channel, thresholdMs, payload)
     text: payload.text,
     runAt: runAt.toISOString(),
     thresholdMs,
+    chatType: pm.getProject(alias)?.chatType,
   });
   saveScheduledMessages();
 
@@ -2998,10 +2933,11 @@ function scheduleOneOffMessage(pm, alias, chatId, channel, thresholdMs, payload)
 
 /**
  * Send Codex's reply back to Feishu.
- * @param {object} replyCtx  - { incomingMessageId, reactionId } for cleaning up the typing indicator
+ * @param {object} replyCtx - { incomingMessageId, reactionId, notice };
+ *   notice marks bridge-generated control replies, never AI conclusions.
  */
 async function sendReplyToFeishu(channel, chatId, replyText, replyCtx) {
-  const { incomingMessageId, reactionId } = replyCtx || {};
+  const { incomingMessageId, reactionId, notice = false } = replyCtx || {};
 
   // Clean up typing indicator reaction first
   if (incomingMessageId && reactionId) {
@@ -3038,7 +2974,7 @@ async function sendReplyToFeishu(channel, chatId, replyText, replyCtx) {
         await uploadAndSendMedia(channel.rawClient, chatId, u, undefined);
       }
       if (replyText?.trim()) {
-        await sendText(channel, chatId, replyText.trim());
+        await sendText(channel, chatId, replyText.trim(), notice);
       }
       return;
     }
@@ -3046,17 +2982,17 @@ async function sendReplyToFeishu(channel, chatId, replyText, replyCtx) {
     // Auto-detect markdown content: use interactive card for rich rendering
     if (shouldUseMarkdownCard(replyText)) {
       try {
-        await sendMarkdownCard(channel, chatId, replyText, incomingMessageId);
+        await sendMarkdownCard(channel, chatId, replyText, incomingMessageId, notice);
         return;
       } catch {
         // Card rendering failed (e.g. too many tables, ErrCode 11310) — fall back to plain text
       }
     }
 
-    await sendText(channel, chatId, replyText);
+    await sendText(channel, chatId, replyText, notice);
   } catch (err) {
     try {
-      await sendText(channel, chatId, `（发送失败）${err instanceof Error ? err.message : String(err)}`);
+      await sendText(channel, chatId, `（发送失败）${err instanceof Error ? err.message : String(err)}`, true);
     } catch {}
   }
 }
@@ -3072,11 +3008,15 @@ async function sendReplyToFeishu(channel, chatId, replyText, replyCtx) {
  * @param {string} text - user message to send to Codex
  * @param {object} channel - LarkChannel instance
  * @param {string} chatId
- * @param {{ incomingMessageId?: string, reactionId?: string|null }} replyCtx
+ * @param {{ incomingMessageId?: string, reactionId?: string|null, canSend?: () => boolean }} replyCtx
  * @returns {Promise<{text:string,sessionId:string,costUsd:number,interrupted?:boolean}|null>}
  */
 async function processAndReply(agent, text, channel, chatId, replyCtx) {
   const { incomingMessageId } = replyCtx || {};
+  const sendMessage = (options) => {
+    if (replyCtx?.canSend && !replyCtx.canSend()) throw new Error('会话已重置或停止，本次请求已取消');
+    return agent.sendMessage(text, options);
+  };
 
   const streamOpts = incomingMessageId ? { replyTo: incomingMessageId } : {};
   let cardCreated = false;
@@ -3179,7 +3119,7 @@ async function processAndReply(agent, text, channel, chatId, replyCtx) {
         }, 1500);
 
         try {
-          finalResult = await agent.sendMessage(text, {
+          finalResult = await sendMessage({
             // onStream no longer pushes partial text to the card. We only use
             // it to detect when real answer text starts (vs tool markers) so
             // we can switch the card to a "generating" marker once. Tool
@@ -3336,11 +3276,8 @@ async function processAndReply(agent, text, channel, chatId, replyCtx) {
           if (placeholderMsgId) {
             try { await channel.rawClient.im.v1.message.delete({ path: { message_id: placeholderMsgId } }); } catch {}
           }
-          const phRes = await channel.rawClient.im.v1.message.create({
-            params: { receive_id_type: 'chat_id' },
-            data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: msgText }) },
-          });
-          placeholderMsgId = phRes?.data?.message_id || null;
+          const phRes = await sendText(channel, chatId, msgText, true);
+          placeholderMsgId = phRes?.messageId || phRes?.data?.message_id || null;
         } catch {}
       };
 
@@ -3355,10 +3292,10 @@ async function processAndReply(agent, text, channel, chatId, replyCtx) {
       }, 3000);
 
       try {
-        const result = await agent.sendMessage(text);
+        const result = await sendMessage();
         clearInterval(fallbackTimer);
         const replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
-        await sendReplyToFeishu(channel, chatId, replyText, { incomingMessageId });
+        await sendReplyToFeishu(channel, chatId, replyText, { incomingMessageId, notice: Boolean(result?.interrupted) });
         // Delete the placeholder now that the real reply is sent
         if (placeholderMsgId) {
           try { await channel.rawClient.im.v1.message.delete({ path: { message_id: placeholderMsgId } }); } catch {}
@@ -3366,7 +3303,7 @@ async function processAndReply(agent, text, channel, chatId, replyCtx) {
         return result;
       } catch (e2) {
         clearInterval(fallbackTimer);
-        await sendReplyToFeishu(channel, chatId, `（系统出错）${e2?.message || String(e2)}`, { incomingMessageId });
+        await sendReplyToFeishu(channel, chatId, `（系统出错）${e2?.message || String(e2)}`, { incomingMessageId, notice: true });
         return null;
       }
     }
@@ -3411,13 +3348,16 @@ async function processAndReply(agent, text, channel, chatId, replyCtx) {
 async function drainQueue(pm, alias) {
   const proj = pm.getProject(alias);
   if (!proj?.started) return;
-  if (proj.agent.info().status === 'busy') return;
+  if (proj.replyPending || proj.agent.info().status === 'busy') return;
 
   const entry = pendingMessages.get(alias);
   if (!entry) return;
   pendingMessages.delete(alias);
 
-  const { text, chatId, channel, thresholdMs, incomingMessageId } = entry;
+  const { text, chatId, channel, thresholdMs, incomingMessageId, groupRecords } = entry;
+  proj.replyPending = true;
+  let accepted = false;
+  const generation = proj.generation;
 
   let reactionId = null;
   let done = false;
@@ -3438,12 +3378,19 @@ async function drainQueue(pm, alias) {
     if (incomingMessageId && reactionId) {
       await removeReaction(channel.rawClient, incomingMessageId, reactionId);
     }
-    await processAndReply(proj.agent, text, channel, chatId, { incomingMessageId });
+    accepted = Boolean(await processAndReply(proj.agent, text, channel, chatId, {
+      incomingMessageId, canSend: () => proj.started && proj.generation === generation,
+    }));
   } catch (e) {
     console.error(`[ERROR] drainQueue: ${e?.message || String(e)}`);
   } finally {
     done = true;
     if (timer) clearTimeout(timer);
+    proj.replyPending = false;
+    if (groupRecords && !accepted && proj.generation === generation) {
+      try { pm.groupMessages.restore(alias, groupRecords); }
+      catch (e) { console.error('[ERROR] queued group buffer persistence:', e); }
+    }
   }
 
   await drainQueue(pm, alias);
@@ -3468,353 +3415,177 @@ function handleCardAction(pm, alias, evt) {
   }
 }
 
-// ─── NormalizedMessage handler (SDK 1.66+ createLarkChannel) ─────
-
-function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
-  return async (msg) => {
-    try {
-      const chatId = msg.chatId;
-      const messageId = msg.messageId;
-      const chatType = msg.chatType; // 'p2p' | 'group'
-
-      if (!chatId || !messageId) return;
-      if (isDuplicate(`${alias}:${messageId}`)) return;
-
-      // SDK-normalized content (already a string, no JSON parsing needed for text/post)
-      let text = (msg.content || '').trim();
-      const attachments = [];
-
-      // Process resources (attachments) from NormalizedMessage
-      if (Array.isArray(msg.resources) && msg.resources.length > 0) {
-        for (const res of msg.resources) {
-          if (res.fileKey) {
-            attachments.push({ type: res.type || 'file', content: res.fileKey, fileName: res.fileName || res.fileKey });
-          }
-        }
-      }
-
-      // Group chat: respond only when needed
-      if (chatType === 'group') {
-        const mentioned = msg.mentionedBot || (Array.isArray(msg.mentions) && msg.mentions.length > 0);
-        const hasAttachment = attachments.length > 0;
-
-        // Remove @_user_X placeholders for routing decisions
-        const cleaned = (text || '').replace(/@_user_\d+\s*/g, '').trim();
-        const decisionText = cleaned.startsWith('【Feishu消息】') ? '' : cleaned;
-        const slashCommandMode = decisionText.startsWith('/');
-
-        // For attachment-only messages in groups: require @ mention
-        if (!slashCommandMode && hasAttachment && !mentioned && (!decisionText || decisionText === '[图片]' || decisionText === '[附件]')) return;
-
-        // For pure text: apply the normal intent filter
-        const mentions = Array.isArray(msg.mentions) ? msg.mentions : [];
-        if (!slashCommandMode && !hasAttachment && (!decisionText || !shouldRespondInGroup(decisionText, mentions))) return;
-
-        // Keep the cleaned text (so the agent doesn't see @_user_X noise)
-        text = cleaned;
-      }
-
-      // Process asynchronously
-      setImmediate(async () => {
-        let reactionId = null;
-        let done = false;
-
-        const timer =
-          thresholdMs > 0
-            ? setTimeout(async () => {
-                if (done) return;
-                reactionId = await addReaction(channel.rawClient, messageId, 'Typing');
-              }, thresholdMs)
-            : null;
-
-        // replyText: null = already sent via streaming; string = pending sendReplyToFeishu
-        let replyText = null;
-        let queued = false;
-        try {
-          const trimmed = String(text || '').trim();
-          const isSlash = trimmed.startsWith('/') && attachments.length === 0;
-
-          if (isSlash) {
-            if (isLegacyClockScheduleCommand(trimmed)) {
-              replyText = '定时语法已更新：请使用 /xx-dd 消息\n例如: /2-15 两小时十五分钟后发送';
-            } else {
-              const scheduleCmd = parseDelayedSendCommand(trimmed);
-              if (scheduleCmd) {
-                if ('error' in scheduleCmd) {
-                  replyText = `错误: ${scheduleCmd.error}`;
-                } else {
-                  const proj = pm.getProject(alias);
-                  if (!proj || !proj.started) {
-                    replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
-                  } else {
-                    const scheduled = scheduleOneOffMessage(
-                      pm,
-                      alias,
-                      chatId,
-                      channel,
-                      thresholdMs,
-                      scheduleCmd,
-                    );
-                    replyText = [
-                      '⏰ 已设置定时发送（一次）',
-                      `延迟: ${scheduleCmd.hours}小时 ${scheduleCmd.minutes}分钟`,
-                      `计划时间: ${formatLocalDateTime(scheduled.runAt)}`,
-                      `消息: ${scheduleCmd.text}`,
-                      `任务: ${scheduled.jobId.slice(0, 8)}…`,
-                    ].join('\n');
-                  }
-                }
-              } else {
-                const r = await handleSlashCommand(pm, alias, trimmed);
-                if (r) {
-                  replyText = String(r.text ?? '');
-                } else {
-                  // Unknown slash command — pass through to Codex (streaming)
-                  const proj = pm.getProject(alias);
-                  if (!proj || !proj.started) {
-                    replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
-                  } else if (proj.agent.info().status === 'busy') {
-                    const steerRes = await proj.agent.steer(trimmed);
-                    if (steerRes.ok) {
-                      replyText = '⤴️ 已并入当前处理轮次。';
-                    } else {
-                      const had = pendingMessages.has(alias);
-                      pendingMessages.set(alias, { text: trimmed, chatId, channel, thresholdMs, incomingMessageId: messageId });
-                      replyText = '⏳ Codex 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
-                      if (had) replyText += '\n（已替换之前排队的消息）';
-                      queued = true;
-                    }
-                  } else {
-                    // Stream the reply to Feishu
-                    if (timer) clearTimeout(timer);
-                    if (messageId && reactionId) {
-                      await removeReaction(channel.rawClient, messageId, reactionId);
-                    }
-                    await processAndReply(proj.agent, trimmed, channel, chatId, { incomingMessageId: messageId });
-                    replyText = null; // already sent via streaming
-                  }
-                }
-              }
-            }
-          } else {
-            const proj = pm.getProject(alias);
-            if (!proj || !proj.started) {
-              replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
-            } else {
-              // Build full text with attachment data
-              let fullText = text;
-              for (const att of attachments) {
-                fullText += `\n[附件: ${att.fileName || att.type || 'attachment'}]`;
-              }
-
-              if (proj.agent.info().status === 'busy') {
-                const steerRes = await proj.agent.steer(fullText);
-                if (steerRes.ok) {
-                  replyText = '⤴️ 已并入当前处理轮次。';
-                } else {
-                  const had = pendingMessages.has(alias);
-                  pendingMessages.set(alias, { text: fullText, chatId, channel, thresholdMs, incomingMessageId: messageId });
-                  replyText = '⏳ Codex 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
-                  if (had) replyText += '\n（已替换之前排队的消息）';
-                  queued = true;
-                }
-              } else {
-                // Stream the reply to Feishu
-                if (timer) clearTimeout(timer);
-                if (messageId && reactionId) {
-                  await removeReaction(channel.rawClient, messageId, reactionId);
-                }
-                await processAndReply(proj.agent, fullText, channel, chatId, { incomingMessageId: messageId });
-                replyText = null; // already sent via streaming
-              }
-            }
-          }
-        } catch (e) {
-          replyText = `（系统出错）${e?.message || String(e)}`;
-        } finally {
-          done = true;
-          if (timer) clearTimeout(timer);
-        }
-
-        // Send non-streaming reply if needed
-        if (replyText !== null) {
-          await sendReplyToFeishu(channel, chatId, replyText, { incomingMessageId: messageId, reactionId });
-        }
-
-        if (!queued) {
-          await drainQueue(pm, alias);
-        }
-      });
-    } catch (e) {
-      console.error('[ERROR] normalized message handler:', e);
-    }
-  };
+function createFeishuChannel(appId, appSecret, notices) {
+  const channel = Lark.createLarkChannel({
+    appId,
+    appSecret,
+    domain: Lark.Domain.Feishu,
+    appType: Lark.AppType.SelfBuild,
+    source: 'feishu-codes-bridge',
+    loggerLevel: Lark.LoggerLevel.info,
+    // The SDK default cache is process-global, and its message dedup keys
+    // omit appId. Bots in the same group receive identical message IDs.
+    cache: new Lark.DefaultCache(),
+    policy: {
+      dmMode: 'open',
+      requireMention: false,
+      // Let the bridge accumulate @all messages; only its own @ gate replies.
+      respondToMentionAll: true,
+    },
+    safety: { chatQueue: { enabled: false } },
+    includeRawEvent: true,
+    outbound: { streamThrottleMs: 400 },
+    wsConfig: { pingTimeout: 3 },
+    handshakeTimeoutMs: 8000,
+  });
+  channel.bridgeNotices = notices;
+  return channel;
 }
 
-// ─── Message handler factory ─────────────────────────────────────
+// ─── NormalizedMessage handler (SDK 1.66+ createLarkChannel) ─────
 
-// DEPRECATED: kept for fallback
-function createMessageHandler(pm, alias, larkClient, thresholdMs) {
-  return async (data) => {
+function isBridgeCommand(text) {
+  const cmd = text.trim().split(/\s+/)[0].toLowerCase();
+  return ['/help', '/?', '/backup', '/status', '/scheduled', '/unschedule',
+    '/start', '/stop', '/reset', '/clear', '/interrupt', '/hard', '/model',
+    '/cost', '/context', '/compact'].includes(cmd)
+    || /^\/\d+-\d+(?:\s|$)/.test(text) || isLegacyClockScheduleCommand(text);
+}
+
+function queuePendingMessage(pm, alias, entry) {
+  const previous = pendingMessages.get(alias);
+  const merge = previous && pm.getProject(alias)?.chatType === 'group';
+  pendingMessages.set(alias, merge ? {
+    ...entry,
+    text: `${previous.text}\n\n${entry.text}`,
+    groupRecords: [...(previous.groupRecords || []), ...(entry.groupRecords || [])],
+  } : entry);
+  return { had: Boolean(previous), merged: Boolean(merge) };
+}
+
+function createNormalizedMessageHandler(pm, projectAlias, channel, thresholdMs) {
+  return async (msg) => {
+    let reservedRecords = null;
+    let accepted = false;
+    let alias = projectAlias;
+    let generation = null;
+    let mayReply = false;
     try {
-      const { message, sender } = data || {};
-      const chatId = message?.chat_id;
-      const messageId = message?.message_id;
-      const chatType = message?.chat_type;
-
-      if (!chatId || !messageId) return;
-      // Include alias in dedup key so multiple bots can process the same message independently
-      if (isDuplicate(`${alias}:${messageId}`)) return;
-      if (!message?.content) return;
-
-      const inbound = await buildInboundFromFeishuMessage(larkClient, message);
-      let text = (inbound.text || '').trim();
-      const attachments = inbound.attachments;
-
-      // Group chat: respond only when needed.
-      if (chatType === 'group') {
-        const mentions = Array.isArray(message?.mentions) ? message.mentions : [];
-        const hasAttachment = attachments.length > 0;
-        const mentioned = mentions.length > 0;
-
-        // Remove @_user_X placeholders for routing decisions.
-        const cleaned = (text || '').replace(/@_user_\d+\s*/g, '').trim();
-        const decisionText = cleaned.startsWith('【Feishu消息】') ? '' : cleaned;
-        const slashCommandMode = decisionText.startsWith('/');
-
-        // For attachment-only messages in groups: require @ mention.
-        if (!slashCommandMode && hasAttachment && !mentioned && (!decisionText || decisionText === '[图片]' || decisionText === '[附件]')) return;
-
-        // For pure text: apply the normal intent filter.
-        if (!slashCommandMode && !hasAttachment && (!decisionText || !shouldRespondInGroup(decisionText, mentions))) return;
-
-        // Keep the cleaned text (so the agent doesn't see @_user_X noise)
-        text = cleaned;
+      const { chatId, messageId, chatType } = msg;
+      if (!chatId || !messageId || !['p2p', 'group'].includes(chatType)) return;
+      if (isOwnMessage(msg, channel.botIdentity)) return;
+      if (pm.notices.isNotice(msg)) return;
+      const text = String(msg.content || '').trim();
+      const resources = msg.resources || [];
+      const isSlash = text.startsWith('/') && resources.length === 0;
+      const mentioned = isBotMentioned(msg, channel.botIdentity);
+      mayReply = chatType === 'p2p' || mentioned || isSlash;
+      if (isDuplicate(`${channel.botIdentity?.openId || projectAlias}:${messageId}`)) return;
+      const conversation = pm.getConversation(projectAlias, chatType, chatId);
+      if (!conversation) return;
+      alias = conversation.alias;
+      const proj = conversation.project;
+      generation = proj.generation;
+      const isGroup = chatType === 'group';
+      const record = isGroup ? groupMessageRecord(msg) : null;
+      if (isGroup && !mayReply) {
+        pm.groupMessages.append(alias, record);
+        return;
       }
 
-      // Process asynchronously
-      setImmediate(async () => {
-        let reactionId = null;
-        let done = false;
+      const controlCommand = isSlash && isBridgeCommand(text);
+      // Reserve at receipt time, before sending cards or making RPC calls.
+      // Slash commands work without @ and retain background messages.
+      // /clear and /reset explicitly clear them; @ AI requests consume them.
+      if (isGroup && mentioned && !controlCommand) {
+        if (proj.started) reservedRecords = [...pm.groupMessages.take(alias), record];
+        else pm.groupMessages.append(alias, record);
+      }
+      const fullText = reservedRecords
+        ? buildGroupPrompt(reservedRecords.slice(0, -1), record)
+        : [text, ...resources.map((res) => `[附件: ${res.fileName || res.type || 'attachment'}]`)].filter(Boolean).join('\n');
 
-        const timer =
-          thresholdMs > 0
-            ? setTimeout(async () => {
-                if (done) return;
-                reactionId = await addReaction(larkClient, messageId, 'Typing');
-              }, thresholdMs)
-            : null;
-
-        let replyText = '';
-        let queued = false;
-        try {
-          const trimmed = String(text || '').trim();
-          const isSlash = trimmed.startsWith('/') && attachments.length === 0;
-
-          if (isSlash) {
-            if (isLegacyClockScheduleCommand(trimmed)) {
-              replyText = '定时语法已更新：请使用 /xx-dd 消息\n例如: /2-15 两小时十五分钟后发送';
-            } else {
-              const scheduleCmd = parseDelayedSendCommand(trimmed);
-              if (scheduleCmd) {
-                if ('error' in scheduleCmd) {
-                  replyText = `错误: ${scheduleCmd.error}`;
-                } else {
-                  const proj = pm.getProject(alias);
-                  if (!proj || !proj.started) {
-                    replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
-                  } else {
-                    const scheduled = scheduleOneOffMessage(
-                      pm,
-                      alias,
-                      chatId,
-                      larkClient,
-                      thresholdMs,
-                      scheduleCmd,
-                    );
-                    replyText = [
-                      '⏰ 已设置定时发送（一次）',
-                      `延迟: ${scheduleCmd.hours}小时 ${scheduleCmd.minutes}分钟`,
-                      `计划时间: ${formatLocalDateTime(scheduled.runAt)}`,
-                      `消息: ${scheduleCmd.text}`,
-                      `任务: ${scheduled.jobId.slice(0, 8)}…`,
-                    ].join('\n');
-                  }
-                }
-              } else {
-                const r = await handleSlashCommand(pm, alias, trimmed);
-                if (r) {
-                  replyText = String(r.text ?? '');
-                } else {
-                  // Unknown slash command — pass through to Codex
-                  const proj = pm.getProject(alias);
-                  if (!proj || !proj.started) {
-                    replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
-                  } else if (proj.agent.info().status === 'busy') {
-                    const had = pendingMessages.has(alias);
-                    pendingMessages.set(alias, { text: trimmed, chatId, larkClient, thresholdMs, incomingMessageId: messageId });
-                    replyText = '⏳ Codex 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
-                    if (had) replyText += '\n（已替换之前排队的消息）';
-                    queued = true;
-                  } else {
-                    const result = await proj.agent.sendMessage(trimmed);
-                    replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
-                    if (!replyText.trim()) {
-                      const costNote = result?.costUsd > 0 ? ` ($${result.costUsd})` : '';
-                      replyText = `✅ ${trimmed.split(/\s/)[0]} 已执行${costNote}`;
-                    }
-                  }
-                }
-              }
+      let replyText = null;
+      if (controlCommand) {
+        if (isLegacyClockScheduleCommand(text)) {
+          replyText = '定时语法已更新：请使用 /xx-dd 消息\n例如: /2-15 两小时十五分钟后发送';
+        } else {
+          const scheduleCmd = parseDelayedSendCommand(text);
+          if (scheduleCmd) {
+            if ('error' in scheduleCmd) replyText = `错误: ${scheduleCmd.error}`;
+            else if (!proj.started) replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
+            else {
+              const scheduled = scheduleOneOffMessage(pm, alias, chatId, channel, thresholdMs, scheduleCmd);
+              replyText = [
+                '⏰ 已设置定时发送（一次）',
+                `延迟: ${scheduleCmd.hours}小时 ${scheduleCmd.minutes}分钟`,
+                `计划时间: ${formatLocalDateTime(scheduled.runAt)}`,
+                `消息: ${scheduleCmd.text}`,
+                `任务: ${scheduled.jobId.slice(0, 8)}…`,
+              ].join('\n');
             }
           } else {
-            const proj = pm.getProject(alias);
-            if (!proj || !proj.started) {
-              replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
-            } else {
-              // Build full text with attachment data
-              let fullText = text;
-              for (const att of attachments) {
-                if (att.type === 'image' && att.content?.startsWith('data:')) {
-                  fullText += `\n[图片(base64 data URL): ${att.fileName || 'image'}]`;
-                } else if (att.content?.startsWith('/') || att.content?.startsWith('file://')) {
-                  fullText += `\n[附件路径] ${att.content}`;
-                } else {
-                  fullText += `\n[附件: ${att.fileName || att.type || 'attachment'}]`;
-                }
-              }
-
-              if (proj.agent.info().status === 'busy') {
-                const had = pendingMessages.has(alias);
-                pendingMessages.set(alias, { text: fullText, chatId, larkClient, thresholdMs, incomingMessageId: messageId });
-                replyText = '⏳ Codex 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
-                if (had) replyText += '\n（已替换之前排队的消息）';
-                queued = true;
-              } else {
-                const result = await proj.agent.sendMessage(fullText);
-                replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
-                if (!replyText.trim()) {
-                  const costNote = result?.costUsd > 0 ? ` ($${result.costUsd})` : '';
-                  replyText = `✅ 已执行（无输出）${costNote}`;
-                }
-              }
-            }
+            const result = await handleSlashCommand(pm, alias, text);
+            replyText = String(result?.text ?? '');
           }
-        } catch (e) {
-          replyText = `（系统出错）${e?.message || String(e)}`;
+        }
+      } else if (!proj.started) {
+        replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
+      } else if (proj.replyPending || proj.agent.info().status === 'busy') {
+        // Serialize steering attempts so several simultaneous @ requests cannot
+        // overtake each other or replace a previously reserved group batch.
+        const steer = async () => {
+          if (!proj.started || proj.generation !== generation || pendingMessages.has(alias)
+            || proj.agent.info().status !== 'busy') return { ok: false };
+          return proj.agent.steer(fullText);
+        };
+        const steering = (proj.steerLock || Promise.resolve()).then(steer);
+        proj.steerLock = steering.catch(() => {});
+        const result = await steering;
+        if (!proj.started || proj.generation !== generation) return;
+        if (result.ok) {
+          accepted = true;
+          replyText = '⤴️ 已并入当前处理轮次。';
+        } else {
+          const queued = queuePendingMessage(pm, alias, {
+            text: fullText, chatId, channel, thresholdMs, incomingMessageId: messageId,
+            groupRecords: reservedRecords,
+          });
+          accepted = true;
+          replyText = '⏳ Codex 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
+          if (queued.had) replyText += queued.merged
+            ? '\n（已合并群聊中之前排队的消息）' : '\n（已替换之前排队的消息）';
+        }
+      } else {
+        // Claim the conversation before awaiting streaming-card creation.
+        // sendMessage() claims busy only once the SDK calls the producer.
+        proj.replyPending = true;
+        try {
+          const result = await processAndReply(proj.agent, fullText, channel, chatId, {
+            incomingMessageId: messageId, canSend: () => proj.started && proj.generation === generation,
+          });
+          accepted = Boolean(result);
         } finally {
-          done = true;
-          if (timer) clearTimeout(timer);
+          proj.replyPending = false;
         }
-
-        await sendReplyToFeishu(larkClient, chatId, replyText, { incomingMessageId: messageId, reactionId });
-
-        if (!queued) {
-          await drainQueue(pm, alias);
-        }
-      });
+      }
+      if (replyText !== null) {
+        await sendReplyToFeishu(channel, chatId, replyText, { incomingMessageId: messageId, notice: true });
+      }
+      await drainQueue(pm, alias);
     } catch (e) {
-      console.error('[ERROR] message handler:', e);
+      console.error('[ERROR] normalized message handler:', e);
+      try {
+        if (!mayReply) return;
+        await sendReplyToFeishu(channel, msg.chatId, `（系统出错）${e?.message || String(e)}`, { incomingMessageId: msg.messageId, notice: true });
+      } catch (sendError) {
+        console.error('[ERROR] message error reply:', sendError);
+      }
+    } finally {
+      if (reservedRecords && !accepted && pm.getProject(alias)?.generation === generation) {
+        try { pm.groupMessages.restore(alias, reservedRecords); }
+        catch (e) { console.error('[ERROR] group buffer persistence:', e); }
+      }
     }
   };
 }
@@ -3863,23 +3634,61 @@ async function runSelfTest() {
   // 5) interrupt returns false when not busy
   ok('interrupt when idle', cp.interrupt() === false);
 
-  // 5b) managed codex config.toml generation
-  const toml = buildCodexConfigToml({
-    codexDefaults: {
-      model: 'glm-5.2', provider: 'maas', approvalPolicy: 'never', sandbox: 'danger-full-access',
-      contextWindow: null,
-      extraConfig: { model_reasoning_summary: 'none', model_reasoning_effort: 'xhigh', project_doc_fallback_filenames: ['CLAUDE.md'] },
-    },
-    providers: {
-      maas: { name: 'MaaS', baseUrl: 'https://example.com/v1', envKey: 'MAAS_API_KEY', wireApi: 'responses' },
-    },
+  // Defaults must not override local Codex settings in thread/start or resume.
+  const calls = [];
+  cp._sessionId = null;
+  cp._send = async (method, params) => {
+    calls.push({ method, params });
+    return { thread: { id: 'local-defaults-test' } };
+  };
+  await cp._ensureThread();
+  ok('thread/start inherits local defaults', JSON.stringify(calls[0]) === JSON.stringify({ method: 'thread/start', params: { cwd: '/tmp' } }));
+  cp._threadReady = false;
+  await cp._ensureThread();
+  ok('thread/resume inherits local defaults', JSON.stringify(calls[1]) === JSON.stringify({ method: 'thread/resume', params: { threadId: 'local-defaults-test', excludeTurns: true } }));
+  cp._threadReady = false;
+  cp._sandbox = 'read-only';
+  cp._approvalPolicy = 'on-request';
+  await cp._ensureThread();
+  ok('explicit thread overrides preserved', calls[2].params.sandbox === 'read-only' && calls[2].params.approvalPolicy === 'on-request');
+
+  // Model and effort move together for /hard; /reset and /start restore defaults.
+  const profileCalls = [];
+  const profileAgent = new CodexAppServer({
+    workDir: '/tmp', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh',
   });
-  ok('toml: model', toml.includes('model = "glm-5.2"'));
-  ok('toml: provider ref', toml.includes('model_provider = "maas"'));
-  ok('toml: provider section', toml.includes('[model_providers.maas]') && toml.includes('env_key = "MAAS_API_KEY"'));
-  ok('toml: memories enabled', toml.includes('[features]') && toml.includes('memories = true'));
-  ok('toml: extra config passthrough', toml.includes('model_reasoning_summary = "none"') && toml.includes('model_reasoning_effort = "xhigh"'));
-  ok('toml: extra config array', toml.includes('project_doc_fallback_filenames = ["CLAUDE.md"]'));
+  profileAgent.start = async () => {};
+  profileAgent._send = async (method, params) => {
+    profileCalls.push({ method, params });
+    if (method === 'thread/start') return { thread: { id: 'profile-test' } };
+    if (method === 'turn/start') return { turn: { id: 'turn-test' } };
+    return { thread: { id: 'profile-test' } };
+  };
+  await profileAgent._ensureThread();
+  ok('new thread uses default model and effort',
+    profileCalls[0].params.model === 'gpt-6.1-sol'
+    && profileCalls[0].params.config.model_reasoning_effort === 'xhigh');
+  const profilePm = new ProjectManager({});
+  profilePm._saveSessions = () => {};
+  profilePm._projects.set('profile', { agent: profileAgent, started: true });
+  await handleSlashCommand(profilePm, 'profile', '/hard');
+  const hardTurn = profileAgent.sendMessage('hard task');
+  await new Promise((resolve) => setImmediate(resolve));
+  const hardParams = profileCalls.find((call) => call.method === 'turn/start')?.params;
+  ok('/hard applies Astra and high on next turn',
+    hardParams?.model === 'gpt-6-astra' && hardParams?.effort === 'high');
+  profileAgent._finishTurn({ status: 'completed' });
+  await hardTurn;
+  await profilePm.resetProject('profile');
+  await profileAgent._ensureThread();
+  const resetParams = profileCalls.filter((call) => call.method === 'thread/start').at(-1)?.params;
+  ok('/reset restores Sol and xhigh for a fresh thread',
+    resetParams?.model === 'gpt-6.1-sol' && resetParams?.config.model_reasoning_effort === 'xhigh');
+  await handleSlashCommand(profilePm, 'profile', '/hard');
+  await profilePm.stopProject('profile');
+  await profilePm.startProject('profile');
+  ok('/start restores default profile',
+    profileAgent.info().model === 'gpt-6.1-sol' && profileAgent.info().reasoningEffort === 'xhigh');
 
   // 6) pendingMessages single-slot queue
   pendingMessages.set('test', { text: 'a', chatId: 'c', channel: null, thresholdMs: 0 });
@@ -3939,11 +3748,361 @@ async function runSelfTest() {
   ok('SDK Domain.Feishu', Lark.Domain.Feishu !== undefined);
   ok('SDK AppType.SelfBuild', Lark.AppType.SelfBuild !== undefined);
 
+  // Exercise the real SDK ingress: mocking normalized handlers skips its
+  // process-global dedup cache and can hide cross-bot message loss.
+  const sdkReceipts = [[], [], []];
+  const sdkErrors = [];
+  const sdkChannels = ['xiaobei', 'relay', 'codes'].map((name, i) => {
+    const channel = createFeishuChannel(`selftest-${name}`, 'test-only');
+    channel.botIdentity = { openId: `selftest-${name}-bot`, name };
+    channel.safety.setBotIdentity(channel.botIdentity);
+    channel.registerDispatcherHandlers();
+    channel.on({
+      message: (msg) => sdkReceipts[i].push(msg),
+      error: (err) => sdkErrors.push(err),
+    });
+    return channel;
+  });
+  try {
+    const sdkMessage = (id, text, mentioned = null) => ({
+      schema: '2.0',
+      header: { event_type: 'im.message.receive_v1', event_id: id },
+      event: {
+        sender: { sender_id: { open_id: 'selftest-user' }, sender_type: 'user' },
+        message: {
+          message_id: id, chat_id: 'shared-sdk-group', chat_type: 'group',
+          message_type: 'text', create_time: String(Date.now()), content: JSON.stringify({ text }),
+          mentions: mentioned ? [{ key: '@_user_1', id: { open_id: mentioned }, name: 'test bot' }] : [],
+        },
+      },
+    });
+    const deliverViaSdk = async (event) => {
+      // The first bot completes before the others receive the same event,
+      // reproducing the observed arrival order instead of masking the race.
+      for (const channel of sdkChannels) {
+        await channel.dispatcher.invoke(event);
+        await new Promise(setImmediate);
+      }
+    };
+    const sdkPrefix = crypto.randomUUID();
+    const sharedEvent = sdkMessage(`${sdkPrefix}-background`, '共同讨论');
+    await deliverViaSdk(sharedEvent);
+    ok('SDK delivers the same group message to every bot', sdkReceipts.every((messages) => messages.length === 1));
+    await deliverViaSdk(sdkMessage(`${sdkPrefix}-relay`, '@_user_1 请检查 relay', 'selftest-relay-bot'));
+    await deliverViaSdk(sdkMessage(`${sdkPrefix}-codes`, '@_user_1 请检查 codes', 'selftest-codes-bot'));
+    ok('SDK preserves each bot mention after another bot receives the event first',
+      sdkReceipts.every((messages) => messages.length === 3)
+      && sdkReceipts[1][1].mentionedBot && !sdkReceipts[0][1].mentionedBot
+      && sdkReceipts[2][2].mentionedBot && !sdkReceipts[1][2].mentionedBot);
+    await deliverViaSdk(sdkMessage(`${sdkPrefix}-slash`, '/status'));
+    ok('SDK delivers unmentioned Slash commands to every bot', sdkReceipts.every((messages) => messages.length === 4));
+    await deliverViaSdk(sdkMessage(`${sdkPrefix}-all`, '@_all 大家看一下'));
+    ok('SDK passes @all messages for accumulation without mentioning a bot',
+      sdkReceipts.every((messages) => messages.length === 5 && messages[4].mentionAll && !messages[4].mentionedBot));
+    await deliverViaSdk(sharedEvent);
+    ok('SDK still deduplicates redelivery within each bot', sdkReceipts.every((messages) => messages.length === 5));
+    ok('SDK ingress has no normalization errors', sdkErrors.length === 0);
+  } finally {
+    await Promise.all(sdkChannels.map((channel) => channel.disconnect()));
+  }
+
   // 12) buildMarkdownCard with options
   const cardWithStop = buildMarkdownCard('test', { showStopButton: true, streaming: true, summary: 'thinking' });
   ok('card with stop button', cardWithStop.body.elements.length === 2 && cardWithStop.body.elements[1].tag === 'action');
   ok('card streaming mode', cardWithStop.config.streaming_mode === true);
   ok('card summary', cardWithStop.config.summary.content === 'thinking');
+
+  // Exercise real message dispatch and streaming with a fake channel: no API calls.
+  const conversationConfig = {
+    projects: {
+      relay: { path: '/tmp', feishu: { appId: 'selftest-bot', appSecretPath: '/secret' }, codex: { model: 'relay-model' } },
+      'xiaobei-dev': { path: '/tmp/xiaobei', feishu: { appId: 'xiaobei-bot', appSecretPath: '/xiaobei-secret' }, codex: { model: 'xiaobei-model' } },
+    }, codexDefaults: { reasoningEffort: 'high' },
+  };
+  const conversationPm = new ProjectManager(conversationConfig);
+  conversationPm._saveSessions = () => {};
+  conversationPm._restoreProjects({ relay: { sessionId: 'legacy-private-thread' } });
+  const privateChat = conversationPm.getConversation('relay', 'p2p', 'private-1');
+  const otherPrivate = conversationPm.getConversation('relay', 'p2p', 'private-2');
+  const groupChat = conversationPm.getConversation('relay', 'group', 'group-1');
+  const otherGroup = conversationPm.getConversation('relay', 'group', 'group-2');
+  const xiaobeiGroup = conversationPm.getConversation('xiaobei-dev', 'group', 'group-1');
+  ok('private legacy session preserved', privateChat.project.agent.info().sessionId === 'legacy-private-thread');
+  ok('conversations use independent Codex instances',
+    new Set([privateChat, otherPrivate, groupChat, otherGroup, xiaobeiGroup].map((c) => c.project.agent)).size === 5);
+  ok('private and group channels inherit the same project configuration',
+    groupChat.project.projectAlias === 'relay' && groupChat.alias === 'relay:group:group-1'
+    && privateChat.project.agent.info().model === 'relay-model' && groupChat.project.agent.info().model === 'relay-model'
+    && groupChat.project.path === privateChat.project.path && groupChat.project.agent.info().sessionId === null);
+  ok('bots in the same group retain their own project configuration',
+    xiaobeiGroup.project.projectAlias === 'xiaobei-dev' && xiaobeiGroup.project.path === '/tmp/xiaobei'
+    && xiaobeiGroup.project.agent.info().model === 'xiaobei-model' && xiaobeiGroup.project.agent !== groupChat.project.agent);
+  const snapshot = Object.fromEntries([...conversationPm._projects].map(([key, project]) => [key, {
+    sessionId: `${key}-thread`, projectAlias: project.projectAlias, chatType: project.chatType, chatId: project.chatId,
+  }]));
+  const restoredPm = new ProjectManager(conversationConfig);
+  restoredPm._saveSessions = () => {};
+  restoredPm._restoreProjects(snapshot);
+  ok('conversation bindings restored after restart',
+    restoredPm.getConversation('relay', 'p2p', 'private-1').project.agent.info().sessionId === 'relay-thread'
+    && restoredPm.getConversation('relay', 'group', 'group-2').project.agent.info().sessionId === `${otherGroup.alias}-thread`
+    && restoredPm.getConversation('xiaobei-dev', 'group', 'group-1').project.agent.info().sessionId === `${xiaobeiGroup.alias}-thread`);
+  const legacyScheduled = await resolveScheduledConversation(conversationPm, 'relay', { chatId: 'group-1' }, {
+    async getChatMode() { return 'group'; },
+  });
+  const privateScheduled = await resolveScheduledConversation(conversationPm, 'relay', { chatId: 'private-2', chatType: 'p2p' }, {});
+  ok('scheduled messages restore into the same project and correct chat session',
+    legacyScheduled?.alias === groupChat.alias && privateScheduled?.alias === otherPrivate.alias);
+
+  const sends = [];
+  const turns = [];
+  const controller = () => ({
+    content: '', sequence: 0, streamingFailed: false, rolloverMessageIds: [], maxChars: 30000,
+    async setContent(value) { this.content = value; this.sequence++; },
+  });
+  const fakeChannel = {
+    botIdentity: { openId: 'selftest-bot-id' },
+    rawClient: {},
+    async send(chatId, input) { sends.push({ chatId, input }); return {}; },
+    async stream(chatId, input) { sends.push({ chatId, stream: true }); await input.markdown(controller()); return {}; },
+  };
+  for (const conversation of [privateChat, otherPrivate, groupChat, otherGroup, xiaobeiGroup]) {
+    conversation.project.agent.sendMessage = async (text) => {
+      turns.push({ alias: conversation.alias, text });
+      return { text: '处理完成' };
+    };
+  }
+  let messageNo = 0;
+  const message = (content, options = {}) => ({
+    chatId: 'group-1', chatType: 'group', messageId: `group-selftest-${++messageNo}`,
+    senderId: 'sender-a', senderName: '张三', createTime: 1000 + messageNo,
+    content, resources: [], mentions: [], mentionedBot: false, ...options,
+  });
+  const groupHandler = createNormalizedMessageHandler(conversationPm, 'relay', fakeChannel, 0);
+  const privateHandler = createNormalizedMessageHandler(conversationPm, 'relay', fakeChannel, 0);
+  const passive = message('请帮我排查？', { mentions: [{ openId: 'another-user' }] });
+  await groupHandler(passive);
+  await groupHandler(passive);
+  await groupHandler(message('第二条背景'));
+  await groupHandler(message('所有人看一下', { mentionAll: true }));
+  await groupHandler(message('', { resources: [{ type: 'image', fileKey: 'image-1' }] }));
+  await groupHandler(message('机器人自己的回复', { senderId: 'selftest-bot-id' }));
+  ok('unmentioned ordinary group messages only accumulate, including media',
+    sends.length === 0 && turns.length === 0 && conversationPm.groupMessages.count(groupChat.alias) === 4);
+  await groupHandler(message('另一群的背景', { chatId: 'group-2' }));
+  await groupHandler(message('归纳这些消息', { mentionedBot: true }));
+  const firstGroupTurn = turns.at(-1);
+  ok('@ request includes ordered background and sender identity',
+    firstGroupTurn.text.includes('张三 (sender-a)')
+    && firstGroupTurn.text.indexOf('请帮我排查？') < firstGroupTurn.text.indexOf('第二条背景')
+    && firstGroupTurn.text.includes('image-1') && firstGroupTurn.text.includes('归纳这些消息'));
+  ok('@ request clears only the current group batch',
+    conversationPm.groupMessages.count(groupChat.alias) === 0
+    && conversationPm.groupMessages.count(otherGroup.alias) === 1
+    && !firstGroupTurn.text.includes('另一群的背景'));
+  await privateHandler(message('私聊内容', { chatType: 'p2p', chatId: 'private-1' }));
+  ok('private request excludes group background', turns.at(-1).text === '私聊内容' && turns.at(-1).alias === 'relay');
+  await groupHandler(message('新的群聊背景'));
+  const sendsBeforeStatus = sends.length;
+  const turnsBeforeStatus = turns.length;
+  await groupHandler(message('/status'));
+  ok('unmentioned Slash command executes immediately and preserves background',
+    sends.length === sendsBeforeStatus + 1 && turns.length === turnsBeforeStatus
+    && conversationPm.groupMessages.count(groupChat.alias) === 1);
+  await groupHandler(message('/model group-updated'));
+  await groupHandler(message('/hard'));
+  await groupHandler(message('/cost'));
+  await groupHandler(message('/context'));
+  await groupHandler(message('/help'));
+  ok('group Slash commands use their existing handlers without @',
+    groupChat.project.agent.info().model === 'gpt-6-astra'
+    && privateChat.project.agent.info().model === 'relay-model'
+    && conversationPm.groupMessages.count(groupChat.alias) === 1);
+  await groupHandler(message('/custom-task-without-mention'));
+  ok('unknown Slash command passes directly to AI without consuming background',
+    turns.at(-1).text === '/custom-task-without-mention'
+    && conversationPm.groupMessages.count(groupChat.alias) === 1);
+  await groupHandler(message('/custom-task', { mentionedBot: true }));
+  ok('unknown slash command receives group background',
+    turns.at(-1).text.includes('新的群聊背景') && turns.at(-1).text.includes('/custom-task'));
+
+  const steered = [];
+  groupChat.project.agent._status = 'busy';
+  groupChat.project.agent.steer = async (text) => { steered.push(text); return { ok: true }; };
+  await groupHandler(message('正在处理时的背景'));
+  await groupHandler(message('追加请求', { mentionedBot: true }));
+  ok('steering includes and consumes group background',
+    steered[0]?.includes('正在处理时的背景') && steered[0]?.includes('追加请求')
+    && conversationPm.groupMessages.count(groupChat.alias) === 0 && !pendingMessages.has(groupChat.alias));
+  await privateHandler(message('群聊忙碌时的私聊', { chatType: 'p2p', chatId: 'private-1' }));
+  ok('busy group does not block private chat', turns.at(-1).text === '群聊忙碌时的私聊');
+  groupChat.project.agent._status = 'idle';
+
+  // A card can take time to start. Concurrent @ requests must queue rather
+  // than start a second turn before sendMessage() has claimed busy.
+  let releaseStream;
+  let firstStream = true;
+  const streamGate = new Promise((resolve) => { releaseStream = resolve; });
+  const slowChannel = { ...fakeChannel, async stream(chatId, input) {
+    if (firstStream) { firstStream = false; await streamGate; }
+    return fakeChannel.stream(chatId, input);
+  } };
+  const concurrentHandler = createNormalizedMessageHandler(conversationPm, 'relay', slowChannel, 0);
+  const turnCountBefore = turns.length;
+  const activeReply = concurrentHandler(message('第一轮请求', { mentionedBot: true }));
+  await concurrentHandler(message('第二批背景'));
+  await concurrentHandler(message('第二轮请求', { mentionedBot: true }));
+  await concurrentHandler(message('第三批背景'));
+  await concurrentHandler(message('第三轮请求', { mentionedBot: true }));
+  ok('busy group requests merge without dropping earlier batches',
+    pendingMessages.get(groupChat.alias)?.text.includes('第二批背景')
+    && pendingMessages.get(groupChat.alias)?.text.includes('第二轮请求')
+    && pendingMessages.get(groupChat.alias)?.text.includes('第三批背景')
+    && pendingMessages.get(groupChat.alias)?.text.includes('第三轮请求'));
+  await concurrentHandler(message('留给下一次的背景'));
+  releaseStream();
+  await activeReply;
+  ok('queued group requests drain after current turn', turns.length === turnCountBefore + 2 && !pendingMessages.has(groupChat.alias));
+  ok('messages arriving during processing remain for the next @', conversationPm.groupMessages.count(groupChat.alias) === 1);
+
+  groupChat.project.agent.stop = async () => {};
+  groupChat.project.agent._sessionId = 'group-before-reset';
+  await groupHandler(message('/reset'));
+  ok('unmentioned group reset clears unsent background and resets only this session',
+    conversationPm.groupMessages.count(groupChat.alias) === 0
+    && groupChat.project.agent.info().sessionId === null
+    && conversationPm.groupMessages.count(otherGroup.alias) === 1
+    && privateChat.project.agent.info().sessionId === 'legacy-private-thread');
+  await groupHandler(message('clear 之前积累的背景'));
+  queuePendingMessage(conversationPm, groupChat.alias, { text: '待处理的群聊请求' });
+  groupChat.project.agent._sessionId = 'group-before-clear';
+  await groupHandler(message('/clear'));
+  ok('unmentioned group clear resets the session and clears unsent background and queue',
+    groupChat.project.agent.info().sessionId === null
+    && conversationPm.groupMessages.count(groupChat.alias) === 0
+    && !pendingMessages.has(groupChat.alias)
+    && conversationPm.groupMessages.count(otherGroup.alias) === 1);
+  await groupHandler(message('暂停前未发送的背景'));
+  await groupHandler(message('/stop'));
+  ok('unmentioned group stop preserves accumulated background',
+    !groupChat.project.started && conversationPm.groupMessages.count(groupChat.alias) === 1);
+  await groupHandler(message('/clear'));
+  ok('unmentioned clear also discards background when the group session is stopped',
+    groupChat.project.started && conversationPm.groupMessages.count(groupChat.alias) === 0);
+  await groupHandler(message('/stop'));
+  await groupHandler(message('/start'));
+  ok('unmentioned group start and stop stay isolated from private chat',
+    groupChat.project.started && privateChat.project.started);
+
+  let releaseCancelledStream;
+  const cancelledGate = new Promise((resolve) => { releaseCancelledStream = resolve; });
+  const cancelledChannel = { ...fakeChannel, async stream(chatId, input) {
+    await cancelledGate;
+    return fakeChannel.stream(chatId, input);
+  } };
+  const turnsBeforeReset = turns.length;
+  const cancelledRequest = createNormalizedMessageHandler(conversationPm, 'relay', cancelledChannel, 0)(message('重置前的请求', { mentionedBot: true }));
+  await groupHandler(message('/reset'));
+  releaseCancelledStream();
+  await cancelledRequest;
+  ok('reset during card creation cancels the old request and does not restore its buffer',
+    turns.length === turnsBeforeReset && conversationPm.groupMessages.count(groupChat.alias) === 0);
+
+  groupChat.project.started = false;
+  await groupHandler(message('暂停期间的请求', { mentionedBot: true }));
+  ok('stopped group retains pending context', conversationPm.groupMessages.count(groupChat.alias) === 1);
+  groupChat.project.started = true;
+  const failingChannel = { ...fakeChannel, async stream() { throw new Error('selftest card failure'); } };
+  groupChat.project.agent.sendMessage = async () => { throw new Error('selftest turn failure'); };
+  await createNormalizedMessageHandler(conversationPm, 'relay', failingChannel, 0)(message('失败的请求', { mentionedBot: true }));
+  ok('failed AI submission restores its group batch', conversationPm.groupMessages.count(groupChat.alias) === 2);
+
+  // The same group message is independently delivered to both project bots.
+  // Mentioning one bot must neither trigger nor consume the other's context.
+  const sharedRelay = conversationPm.getConversation('relay', 'group', 'shared-room');
+  const sharedXiaobei = conversationPm.getConversation('xiaobei-dev', 'group', 'shared-room');
+  for (const conversation of [sharedRelay, sharedXiaobei]) {
+    conversation.project.agent.stop = async () => {};
+    conversation.project.agent.sendMessage = async (text) => {
+      turns.push({ alias: conversation.alias, text });
+      return { text: '处理完成' };
+    };
+  }
+  const xiaobeiChannel = { ...fakeChannel, botIdentity: { openId: 'xiaobei-bot-id' } };
+  const xiaobeiHandler = createNormalizedMessageHandler(conversationPm, 'xiaobei-dev', xiaobeiChannel, 0);
+  const deliverToBoth = (msg) => Promise.all([groupHandler(msg), xiaobeiHandler(msg)]);
+  await deliverToBoth(message('共同讨论的内容', { chatId: 'shared-room' }));
+  ok('both project bots accumulate the same group message independently',
+    conversationPm.groupMessages.count(sharedRelay.alias) === 1
+    && conversationPm.groupMessages.count(sharedXiaobei.alias) === 1);
+  const turnsBeforeXiaobei = turns.length;
+  await deliverToBoth(message('请检查小贝开发', {
+    chatId: 'shared-room', mentions: [{ openId: 'xiaobei-bot-id' }],
+  }));
+  ok('@ xiaobei triggers only its project and leaves relay background intact',
+    turns.length === turnsBeforeXiaobei + 1 && turns.at(-1).alias === sharedXiaobei.alias
+    && turns.at(-1).text.includes('共同讨论的内容')
+    && conversationPm.groupMessages.count(sharedXiaobei.alias) === 0
+    && conversationPm.groupMessages.count(sharedRelay.alias) === 2);
+  const turnsBeforeRelay = turns.length;
+  await deliverToBoth(message('请检查 relay 运维', {
+    chatId: 'shared-room', mentions: [{ openId: 'selftest-bot-id' }],
+  }));
+  ok('@ relay uses its own project and accumulated group context',
+    turns.length === turnsBeforeRelay + 1 && turns.at(-1).alias === sharedRelay.alias
+    && turns.at(-1).text.includes('共同讨论的内容') && turns.at(-1).text.includes('请检查小贝开发')
+    && conversationPm.groupMessages.count(sharedRelay.alias) === 0
+    && conversationPm.groupMessages.count(sharedXiaobei.alias) === 1);
+  await groupHandler(message('/model shared-relay-model relay', { chatId: 'shared-room' }));
+  ok('commands naming this project operate on its current group channel',
+    sharedRelay.project.agent.info().model === 'shared-relay-model'
+    && privateChat.project.agent.info().model === 'relay-model'
+    && sharedXiaobei.project.agent.info().model === 'xiaobei-model');
+  await deliverToBoth(message('清空前的共同背景', { chatId: 'shared-room' }));
+  await deliverToBoth(message('/clear', { chatId: 'shared-room' }));
+  ok('unmentioned clear resets each receiving bot in this group independently',
+    conversationPm.groupMessages.count(sharedRelay.alias) === 0
+    && conversationPm.groupMessages.count(sharedXiaobei.alias) === 0
+    && conversationPm.groupMessages.count(groupChat.alias) === 2
+    && privateChat.project.agent.info().sessionId === 'legacy-private-thread');
+
+  // Deliver the reset replies back to both bots before the send API returns.
+  // This reproduces /clear immediately refilling each bot's background with
+  // the other bot's acknowledgement, including cross-app sender-ID differences.
+  const noticeHandlers = [];
+  const noticeChannels = [fakeChannel, xiaobeiChannel].map((base, senderIndex) => ({
+    ...base, bridgeNotices: conversationPm.notices,
+    async send(chatId, input) {
+      const text = input.text || input.card.body.elements[0].content;
+      const outgoing = message(text, { chatId, raw: { sender: { sender_type: 'app' } } });
+      for (let recipientIndex = 0; recipientIndex < noticeHandlers.length; recipientIndex++) {
+        await noticeHandlers[recipientIndex]({ ...outgoing,
+          senderId: recipientIndex === senderIndex ? base.botIdentity.openId : `other-bot-as-seen-by-${recipientIndex}`,
+        });
+      }
+      return { messageId: outgoing.messageId };
+    },
+  }));
+  noticeHandlers.push(
+    createNormalizedMessageHandler(conversationPm, 'relay', noticeChannels[0], 0),
+    createNormalizedMessageHandler(conversationPm, 'xiaobei-dev', noticeChannels[1], 0),
+  );
+  const clearEvent = message('/clear', { chatId: 'shared-room' });
+  await Promise.all(noticeHandlers.map((handler) => handler(clearEvent)));
+  ok('group clear acknowledgements do not refill other bots background',
+    conversationPm.groupMessages.count(sharedRelay.alias) === 0
+    && conversationPm.groupMessages.count(sharedXiaobei.alias) === 0);
+  await sendReplyToFeishu(noticeChannels[0], 'shared-room', '**模型状态**\n当前模型已切换', { notice: true });
+  ok('control replies rendered as cards are excluded from group background',
+    conversationPm.groupMessages.count(sharedXiaobei.alias) === 0);
+  await sendReplyToFeishu(noticeChannels[0], 'shared-room', 'AI 分析后的实质性结论');
+  ok('other bots AI conclusions remain group background',
+    conversationPm.groupMessages.count(sharedXiaobei.alias) === 1
+    && conversationPm.groupMessages.messages.get(sharedXiaobei.alias)[0].content === 'AI 分析后的实质性结论');
+  await noticeHandlers[1](message(`${sharedRelay.alias} 会话已重置，下次对话将开始新会话（gpt-6.1-sol + xhigh）`, {
+    chatId: 'shared-room', raw: { sender: { sender_type: 'user' } },
+  }));
+  ok('user quotes of control replies are preserved', conversationPm.groupMessages.count(sharedXiaobei.alias) === 2);
 
   console.log('[OK] Selftests finished');
 }
@@ -3974,56 +4133,49 @@ try {
   if (!SELFTEST) process.exit(1);
 }
 
-// Generate the managed Codex home (config.toml: providers, defaults, memories)
-ensureCodexHome(bridgeConfig);
+// Codex loads its own config, credentials, skills and memories.
 
 const pm = new ProjectManager(bridgeConfig);
 await pm.init();
 
-// Start one Feishu bot per project (using createLarkChannel for SDK 1.66+)
+// Each project's bot receives both private and group messages.
 channelMap = new Map();  // alias → LarkChannel
-const larkClientMap = new Map(); // alias → rawClient (for media/reaction helpers)
-for (const [alias, proj] of Object.entries(bridgeConfig.projects)) {
+const botProjects = indexBotProjects(bridgeConfig.projects);
+for (const [appId, { alias, project: proj }] of botProjects) {
   const secret = mustRead(proj.feishu.appSecretPath, `Feishu secret for "${alias}"`);
 
-  const channel = Lark.createLarkChannel({
-    appId: proj.feishu.appId,
-    appSecret: secret,
-    domain: Lark.Domain.Feishu,
-    appType: Lark.AppType.SelfBuild,
-    source: 'feishu-codes-bridge',
-    loggerLevel: Lark.LoggerLevel.info,
-    policy: {
-      dmMode: 'open',
-      requireMention: false,
-      respondToMentionAll: false,
-    },
-    safety: { chatQueue: { enabled: false } },
-    includeRawEvent: true,
-    outbound: { streamThrottleMs: 400 },
-    wsConfig: { pingTimeout: 3 },
-    handshakeTimeoutMs: 8000,
-  });
+  const channel = createFeishuChannel(appId, secret, pm.notices);
 
   channel.on({
     message: (msg) => {
       void createNormalizedMessageHandler(pm, alias, channel, bridgeConfig.thinkingThresholdMs)(msg);
     },
-    cardAction: (evt) => handleCardAction(pm, alias, evt),
+    cardAction: (evt) => {
+      const conversation = [...pm._projects.entries()].find(([, instance]) =>
+        instance.feishuAppId === appId && instance.chatId === evt.chatId);
+      if (conversation) handleCardAction(pm, conversation[0], evt);
+    },
     reconnecting: () => console.log(`[WS] "${alias}" reconnecting...`),
     reconnected: () => console.log(`[WS] "${alias}" reconnected`),
     error: (err) => console.error(`[WS] "${alias}" error:`, err?.message || String(err)),
   });
 
-  await channel.connect();
+  try {
+    // channel.connect() has a WebSocket handshake timeout, but its initial
+    // bot-identity/token HTTP calls use the SDK default axios instance with
+    // timeout=0. A stale TUN route can therefore leave startup hanging forever.
+    await withTimeout(channel.connect(), 30_000, `Feishu channel "${alias}" connect timeout after 30000ms`);
+  } catch (e) {
+    console.error(`[FATAL] Failed to connect Feishu bot "${alias}": ${e?.message || String(e)}`);
+    throw e;
+  }
   channelMap.set(alias, channel);
-  larkClientMap.set(alias, channel.rawClient);
 
   const botId = channel.botIdentity?.openId || '?';
-  console.log(`[OK] Bot started: "${alias}" (appId=${proj.feishu.appId}, path=${proj.path}, botOpenId=${botId})`);
+  console.log(`[OK] Bot started: "${alias}" (appId=${appId}, path=${proj.path}, botOpenId=${botId})`);
 }
 
-restoreScheduledMessages(pm, channelMap, bridgeConfig.thinkingThresholdMs);
+await restoreScheduledMessages(pm, channelMap, bridgeConfig.thinkingThresholdMs);
 
 console.log(`[OK] Feishu bridge v${BRIDGE_VERSION} started — ${Object.keys(bridgeConfig.projects).length} project(s)`);
 console.log(`[OK] Allowed local media dirs: ${ALLOWED_LOCAL_MEDIA_DIRS.join(', ') || '(none)'}`);

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node bridge.mjs",
+    "test": "node --test conversations.test.mjs notices.test.mjs && node bridge.mjs --selftest",
     "setup": "node setup-service.mjs"
   },
   "dependencies": {

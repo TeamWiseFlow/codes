@@ -27,8 +27,11 @@ jobs:
 
     - name: Syntax check
       working-directory: bridge
-      run: node --check bridge.mjs
+      run: |
+        node --check bridge.mjs
+        node --check conversations.mjs
+        node --check notices.mjs
 
-    - name: Self-test
+    - name: Tests and self-test
       working-directory: bridge
-      run: node bridge.mjs --selftest
+      run: npm test

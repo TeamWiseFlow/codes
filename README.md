@@ -21,17 +21,11 @@
 
 🚀【2026.9.2】**基座切换为 Codex**：bridge 通过 `codex app-server`（JSON-RPC over stdio）完整桥接 Codex 的 IO——流式增量文本、打断、跨进程会话恢复、审批应答、token 统计。
 
-🚀 每日自动备份，`/backup` 命令可随时手动触发
+🚀 直接复用本机 Codex 配置、登录与 skills，无需单独配置模型
+
+🚀 支持在群聊中使用
 
 🚀 延迟消息（计划消息）：`/小时-分钟 “要延迟发送的消息”`（xx 小时 xx 分钟后，内容发给 Codex）
-
-- 不需要任何订阅，走你自己的模型服务端点；
-- 国内的 GLM、Qwen、DeepSeek 等 coding 套餐（任何 OpenAI Responses 兼容端点）都能直接用；
-- 没有海外账号、网络环境的麻烦。
-
-至于云端服务器，2C4G 足够了，腾讯云首单一年 79……当然本项目不需要公网 IP，你搞台二手电脑装个 ubuntu 扔家里或者办公室也是可以的……硬件几乎零成本。
-
-**🌹 致敬：飞书连接桥方案来自：https://github.com/AlexAnys/feishu-openclaw**
 
 ## 架构
 
@@ -42,13 +36,13 @@
                     (多项目管理)                  (initialize/thread/turn
                          │                         item delta/审批应答)
                     createLarkChannel × N
-                    (每个项目一个飞书 bot)
+                    (每个 bot App 一个连接)
 ```
 
 - **bridge.mjs** — 单 Node.js 进程，同时服务多个飞书 bot + 多个 Codex 子进程
-- **CodexAppServer** — 每个项目一个 `codex app-server` 子进程：`initialize` 握手 → `thread/start`（新会话）或 `thread/resume`（恢复会话）→ `turn/start` 发消息，`item/agentMessage/delta` 流式增量 → 飞书打字机卡片；`turn/interrupt` 打断；所有服务端请求（审批等）自动应答，绝不挂起
-- **ProjectManager** — 管理多项目生命周期，每个项目独立的 Codex 实例和飞书 bot
-- **托管 Codex Home** — bridge 启动时从 `bridge.json` 生成 `~/.codes/codex-home/config.toml`（providers、默认模型、内置 memory 开关），会话数据与记忆都落在 `~/.codes` 内，自动进入每日备份
+- **CodexAppServer** — 每个聊天会话一个 `codex app-server` 子进程，首次请求时启动：`initialize` 握手 → `thread/start`（新会话）或 `thread/resume`（恢复会话）→ `turn/start` 发消息，`item/agentMessage/delta` 流式增量 → 飞书打字机卡片；`turn/interrupt` 打断；所有服务端请求（审批等）自动应答，绝不挂起
+- **ProjectManager** — 管理项目配置与聊天会话；每个群、每个私聊独立保存 thread、进程、模型切换、用量和队列。每个 bot 固定绑定一个项目，群聊和私聊直接使用该项目配置
+- **本机 Codex** — 继承本机默认配置与 `CODEX_HOME`（通常为 `~/.codex`），不生成或覆盖 Codex 配置。`.codes` 只保存 bridge 配置、飞书凭据、日志和会话映射。
 - **createLarkChannel** — 飞书 SDK 1.66+ 高层 API，封装 WebSocket 连接、消息归一化、流式卡片、卡片交互回调
 
 ### 飞书 SDK 能力
@@ -65,10 +59,10 @@
 
 ## 前置要求
 
-- **Node.js** 18+（推荐 22+）
+- **Node.js** 22+
 - **@larksuiteoapi/node-sdk** 1.66.0（飞书 SDK，bridge 自带）
-- **Codex CLI** — `npm install -g @openai/codex`（协议基线版本：0.152.1）
-- **一个 OpenAI Responses 兼容的模型端点** + API key
+- **Codex CLI** — `npm install -g @openai/codex`（协议基线版本：0.159.2）
+- **本机 Codex 已配置并能正常使用**（登录或模型端点配置均由 Codex 管理）
 - **飞书自建应用** — 需要 App ID + App Secret（详见下方配置步骤）
 
 ## 快速开始
@@ -102,18 +96,6 @@ cp bridge.example.json ~/.codes/bridge.json
       }
     }
   },
-  "providers": {
-    "maas": {
-      "name": "我的模型网关",
-      "baseUrl": "https://your-gateway.example.com/compatible-mode/v1",
-      "envKey": "MAAS_API_KEY",
-      "wireApi": "responses"
-    }
-  },
-  "codexDefaults": {
-    "model": "glm-5.2",
-    "provider": "maas"
-  },
   "codexPath": "codex",
   "debug": false
 }
@@ -126,12 +108,9 @@ echo -n "your-app-secret" > ~/.codes/secrets/myapp_secret
 chmod 600 ~/.codes/secrets/myapp_secret
 ```
 
-将模型端点的 API key 写入 `bridge/.env`（变量名对应 `providers.*.envKey`）：
+先在终端确认 `codex` 能正常工作。bridge 使用同一套 Codex 配置、登录、MCP 和记忆设置。
 
-```bash
-echo 'MAAS_API_KEY=sk-xxxx' > bridge/.env
-chmod 600 bridge/.env
-```
+在仓库根目录运行 `./deploy.sh` 可安装 bridge 依赖并启用用户服务；已有 `~/.codes/bridge.json` 会直接复用，不覆盖项目和凭据。脚本不安装或重新配置 Codex。
 
 ### 3. 启动
 
@@ -149,39 +128,71 @@ node bridge.mjs
 | `projects.*.path` | 项目代码仓路径 | 必填 |
 | `projects.*.feishu.appId` | 飞书 App ID | 必填 |
 | `projects.*.feishu.appSecretPath` | Secret 文件路径 | 必填 |
-| `projects.*.codex.model` | 该项目的模型（覆盖默认） | `codexDefaults.model` |
-| `projects.*.codex.provider` | 该项目的 provider（须引用 `providers` 中的 key） | `codexDefaults.provider` |
-| `projects.*.codex.sandbox` | 沙箱模式（`read-only` / `workspace-write` / `danger-full-access`） | `danger-full-access` |
-| `projects.*.codex.contextWindow` | 该项目的上下文窗口（token，影响自动压缩时机；实际可用约为配置值的 95%） | `codexDefaults.contextWindow` |
-| `projects.*.codex.*` | 其余任意 codex 配置键（snake_case，如 `model_reasoning_summary`、`model_reasoning_effort`）原样透传给该项目会话（thread/start config，优先级最高） | `codexDefaults.*` |
-| `providers.<key>.baseUrl` | Responses 兼容端点（`/responses` 会自动拼接） | 必填 |
-| `providers.<key>.envKey` | 存放 API key 的环境变量名 | 必填 |
-| `providers.<key>.wireApi` | 协议（仅支持 `responses`） | `"responses"` |
-| `codexDefaults.model` / `.provider` | 全局默认模型 / provider | — |
-| `codexDefaults.contextWindow` | 上下文窗口大小（token） | — |
-| `codexDefaults.*` | 其余任意 codex 配置键（snake_case）渲染进 `config.toml`（全局默认，项目级同名键可覆盖） | — |
-| `thinkingThresholdMs` | thinking 状态提示阈值（ms） | 2500 |
-| `codexPath` | codex CLI 路径（systemd 下建议绝对路径） | `"codex"` |
+| `codexPath` | 本机 codex CLI 路径，服务中建议使用绝对路径 | `"codex"` |
+| `thinkingThresholdMs` | 进度提示阈值（ms） | 2500 |
 | `debug` | 调试模式 | `false` |
-| `backup.time` | 每日自动备份时间（HH:MM） | `"04:16"` |
-| `backup.dest` | 备份目标目录 | `"~/Backups"` |
-| `backup` | 设为 `false` 可完全禁用自动备份 | — |
+| `backup` | 可选手动备份配置（如 `{ "dest": "~/Backups" }`） | `false` |
 
-### 沙箱与审批
+默认不传模型、推理强度、provider、沙箱、审批或上下文配置覆盖，全部由本机 Codex 决定。可通过 `codexDefaults.model` 和 `codexDefaults.reasoningEffort` 设置所有项目的新会话及 `/reset` 默认值，例如 `gpt-6.1-sol` 和 `xhigh`；`projects.*.codex` 可覆盖单个项目。provider 必须已在本机 Codex 中定义。旧的 `providers`、`mcpServers` 字段不再生成配置，需要在本机 Codex 中维护。
 
-本机环境若无法创建 user namespace（常见于 AppArmor 限制的 Ubuntu），codex 的 bubblewrap 沙箱不可用，默认配置为 `danger-full-access` + `approvalPolicy: never`（代理在受信服务器上自主执行，与多数生产部署姿态一致）。若你的环境支持沙箱，可在 `codexDefaults` / 项目级 `codex` 里改成 `workspace-write`。
+bridge 不再安排每日备份。仅显式配置 `backup.dest` 后，`/backup` 才能手动打包 `.codes`；它不包含默认 `~/.codex`。
 
-### 第三方模型的上下文窗口上限
+已有 `.codes/codex-home` 不会删除或迁移。旧线程不在当前 Codex Home 时，恢复失败会新建线程；旧历史仍留在原目录。
 
-`model_context_window` 会受模型元数据里 `max_context_window` 的硬性钳制。Codex 不认识的模型（如 GLM、Qwen）会落入 fallback 元数据（上限 272k，可用约 258k），配置 1M 也会被钳到 272k。解决办法：提供一个自定义模型目录（`models.json`，含 `context_window` / `max_context_window` / `model_messages.instructions_template`），并在 `codexDefaults` 里设 `model_catalog_json = "/path/to/models.json"`（全局生效，重启 bridge 后渲染进 config.toml）。注意该目录会**替换**内置目录，需要把所有在用的第三方模型都列进去。
+### 项目 Bot 与群聊通道
 
-### 自动备份
+每个项目绑定自己的 Bot App ID 和 Secret。群聊、私聊都使用这个 bot 对应的项目目录与默认 Codex 配置；每个聊天会话有独立的进程和 thread。将多个项目 bot 拉入同一个群后，它们继续代表各自的项目。
 
-bridge 内置每日定时备份，默认凌晨 04:16 将 `~/.codes` 的核心内容（bridge.json、secrets、models.json、codex-home 的 config/sessions/memories/skills）打包为 `backup_YYYYMMDD_HHmm.tar.gz`。排除项：`logs/`、`bridge-sessions.json`、codex-home 的插件同步缓存（`.tmp/`，可按需重建）、内部日志库（`logs_2.sqlite*`）、运行时临时目录、以及 SQLite 的 `-wal`/`-shm` 活动侧车文件（运行中打包不安全；主 `.sqlite` 保留最近检查点）。设为 `false` 可禁用；飞书发 `/backup` 随时手动触发。
+例如小贝开发与 relay 运维：
+
+```json
+{
+  "projects": {
+    "xiaobei-dev": {
+      "path": "/home/ctyun/wiseflow",
+      "feishu": {
+        "appId": "cli_xiaobei",
+        "appSecretPath": "~/.codes/secrets/xiaobei_secret"
+      }
+    },
+    "relay": {
+      "path": "/home/ctyun/wiseflow-relay",
+      "feishu": {
+        "appId": "cli_relay",
+        "appSecretPath": "~/.codes/secrets/relay_secret"
+      }
+    }
+  }
+}
+```
+
+将这两只 bot 加入同一个群即可，配置文件维持已有的项目条目，群 ID 从收到的消息中自动识别。
+
+| 输入通道 | 对应项目 | 会话 |
+|----------|----------|------|
+| 私聊小贝 bot | xiaobei-dev | 小贝私聊会话 |
+| 群里 @ 小贝 bot | xiaobei-dev | 小贝在该群的独立会话 |
+| 私聊 relay bot | relay | relay 私聊会话 |
+| 群里 @ relay bot | relay | relay 在该群的独立会话 |
+
+两只 bot 各自累积本群消息；@ 小贝只触发小贝，relay 会将这条消息继续作为背景积累，反之亦然。两只 bot 的背景、进程、thread、模型切换和队列分别维护。相同 bot 在不同群也有独立的会话。
+
+第一个私聊保留原项目 alias 和 thread，后续私聊使用 `alias:p2p:chat_id`；每个群聊使用 `alias:group:chat_id`。这些是自动生成的运行时会话标识，无需加入项目配置，重启后恢复绑定。
+
+群聊行为：
+
+- 未 @ 当前机器人的普通消息：只保存消息，不发回复、进度卡或表情。@ 其他人、@ 全体和问句同样累积。
+- @ 当前机器人：把积累的消息按顺序拼接为背景，再加上当前请求发送给 AI；后续到达的消息留给下一次 @。记录包含发信人、时间、正文，图片和文件附资源描述；姓名不可用时使用发信人的 `open_id`。
+- 未消费的消息保存到 `~/.codes/bridge-group-messages.json`，重启后仍可累积。AI 提交失败时恢复该批消息。
+- bot 自身消息不累积；其他 bot 的 AI 回复保留。bridge 的命令回执、排队提示、定时通知和普通文本进度按发送记录排除，避免 `/clear` 后又积累“已重置”回执。回执 ID 自动保存到 `~/.codes/bridge-notices.json`，用户引用相同文字不会被过滤。
+- 群中完整支持 Slash 命令，无需 @，收到后各 bot 直接执行，默认操作各自项目在当前群的会话。`/status` 可查看积累条数；`/clear` 和 `/reset` 重置当前群的会话，同时清空尚未发送给 AI 的背景及待处理请求。其他管理命令保留背景。未 @ 的未知斜杠命令直接转给 Codex，保留积累；带 @ 的未知斜杠命令会一起发送背景。
+- AI 忙碌时，@ 请求携带积累的背景，通过 `turn/steer` 优先并入当前轮次；无法并入时合并排队。
+
+现有项目配置可直接接收群聊；飞书应用需开通下方的群消息权限并发布版本，将相应项目 bot 加入群即可。
 
 ### .env 调优（可选）
 
-参见 `bridge/.env.example`。模型端点 API key（`providers.*.envKey` 对应的变量）也放在这里。
+参见 `bridge/.env.example`。用户服务如需额外环境变量，可放在 `~/.codes/bridge.env`；bridge 自身也会加载 `bridge/.env`。模型配置和登录由本机 Codex 管理。
 
 ### 飞书自建应用创建步骤
 
@@ -194,6 +205,7 @@ bridge 内置每日定时备份，默认凌晨 04:16 将 `~/.codes` 的核心内
    - `im:message` — 获取与发送消息
    - `im:message:send_as_bot` — 以机器人身份发消息（避免 403）
    - `im:message.group_at_msg` — 接收群聊中 @ 机器人的消息
+   - `im:message.group_msg` — 获取群组中所有消息（群聊自动累积必需；仅有 @ 消息权限无法收到其他消息，参见[官方说明](https://open.feishu.cn/solutions/detail/ticket?lang=zh-CN)）
    - `im:message.p2p_msg` — 接收机器人单聊消息
    - `im:resource` — 上传/下载图片与文件（**收图/收视频**必须）
 
@@ -206,6 +218,7 @@ bridge 内置每日定时备份，默认凌晨 04:16 将 `~/.codes` 的核心内
       "cardkit:card:write",
       "im:message",
       "im:message.group_at_msg:readonly",
+      "im:message.group_msg",
       "im:message.p2p_msg:readonly",
       "im:message:send_as_bot",
       "im:resource"
@@ -232,9 +245,11 @@ bridge 内置每日定时备份，默认凌晨 04:16 将 `~/.codes` 的核心内
 |------|------|
 | `/start [alias\|all]` | 启动项目的 Codex 会话 |
 | `/stop [alias\|all]` | 停止项目的 Codex 会话 |
-| `/reset [alias]` | 重置会话（清除历史，开始新对话） |
+| `/reset [alias]` | 重置会话并恢复项目默认模型和推理强度 |
+| `/clear [alias]` | 同 `/reset`；群聊中两者都会清空尚未发送给 AI 的积累 |
 | `/interrupt [alias]` | 打断当前正在处理的消息 |
 | `/model [名称] [alias]` | 查看或切换模型（下一条消息生效） |
+| `/hard [alias]` | 切换到 `gpt-6-astra` + `high`（下一条消息生效） |
 | `/cost [alias]` | 查看 token 用量（累计/上一轮） |
 | `/context [alias]` | 查看上下文窗口占用 |
 | `/compact [alias]` | 压缩会话历史 |
@@ -244,10 +259,12 @@ bridge 内置每日定时备份，默认凌晨 04:16 将 `~/.codes` 的核心内
 
 其他 `/` 开头的消息会作为普通消息转发给 Codex。
 普通消息直接发送给对应项目的 Codex 处理。
+群聊普通消息仅在 @ 当前机器人时触发回复；Slash 命令无需 @，默认操作当前聊天的会话。
+项目停止后再次 `/start` 也会恢复默认模型和推理强度，但保留会话历史。
 
 ### 消息队列与打断
 
-当 Codex 正在处理上一条消息时，新发送的消息会自动排队（单槽设计，仅保留最新一条）：
+当 Codex 正在处理上一条消息时，新请求优先通过 `turn/steer` 并入当前轮次。无法并入时，私聊使用单槽队列，仅保留最新一条：
 
 ```
 用户发 A  →  Codex 开始处理
@@ -257,6 +274,7 @@ A 处理完  →  回复 A 结果  →  自动开始处理 C
 ```
 
 如需打断当前处理，发送 `/interrupt`（映射到 `turn/interrupt`）。
+群聊无法并入的 @ 请求会合并排队，保留各自的背景和请求；不会覆盖前一批。不同聊天的队列互不影响。
 
 ### 延迟消息发送
 
@@ -315,15 +333,18 @@ systemctl --user restart codes-feishu-bridge
 | 回复"模型认证失败"类错误 | 检查 `bridge/.env` 中 `envKey` 对应的变量是否已设置 |
 | 日志出现 bwrap/user namespace 警告 | 本机不支持沙箱，默认配置已用 `danger-full-access`，可忽略 |
 | 进程重启后会话丢失 | 正常行为——bridge 会自动以 `thread/resume` 恢复上次会话 |
-| 多项目配置不生效 | 确认每个项目的 `feishu.appId` 不同，每个 bot 对应一个项目 |
+| 多项目配置不生效 | 每个项目绑定独立的 Bot App ID；同一 App ID 不能配置给多个项目 |
+| 同群多个 bot 只有一个响应，其他 bot 漏消息 | 确认每个 channel 使用独立的 `Lark.DefaultCache`；SDK 默认共享去重缓存会把其他 bot 收到的同一消息误判为重复 |
+| 群聊只有 @ 消息能累积 | 开通 `im:message.group_msg` 权限，发布应用版本，并将机器人加入群 |
 
 ## 自测
 
 ```bash
 node bridge/bridge.mjs --selftest
+cd bridge && npm test
 ```
 
-验证配置加载和基本功能，不会连接飞书。
+验证项目与 bot 绑定、同群多 bot、真实 SDK 消息归一化与独立去重、回执过滤、消息累积、会话隔离、并发排队和失败恢复，不会连接飞书。
 
 ## License
 
